@@ -52,19 +52,33 @@ private struct MenuBarView: View {
     @ObservedObject var settings: AppSettings
     @Environment(\.openSettings) private var openSettings
 
+    private var legacySpeechAuthorization: SFSpeechRecognizerAuthorizationStatus? {
+        if #available(macOS 26.0, *) { return nil }
+        return SFSpeechRecognizer.authorizationStatus()
+    }
+
     private var authorizationSummary: String {
-        let access = TextInjector.hasPermission ? "辅助功能已授权" : "辅助功能未授权"
-        let microphone = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-            ? "麦克风已授权" : "麦克风未授权"
-        let speech = SFSpeechRecognizer.authorizationStatus() == .authorized
-            ? "Apple 识别已授权" : "Apple 识别未授权"
-        return "\(access) · \(microphone) · \(speech)"
+        var parts = [
+            TextInjector.hasPermission ? "辅助功能已授权" : "辅助功能未授权",
+            AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+                ? "麦克风已授权" : "麦克风未授权"
+        ]
+        if let status = legacySpeechAuthorization {
+            switch status {
+            case .authorized: parts.append("Apple 识别已授权")
+            case .notDetermined: parts.append("Apple 识别尚未请求授权")
+            case .denied: parts.append("Apple 识别已拒绝")
+            case .restricted: parts.append("Apple 识别受系统限制")
+            @unknown default: parts.append("Apple 识别授权状态未知")
+            }
+        }
+        return parts.joined(separator: " · ")
     }
 
     private var allPermissionsGranted: Bool {
         TextInjector.hasPermission &&
             AVCaptureDevice.authorizationStatus(for: .audio) == .authorized &&
-            SFSpeechRecognizer.authorizationStatus() == .authorized
+            (legacySpeechAuthorization == nil || legacySpeechAuthorization == .authorized)
     }
 
     private var connectionSummary: String {
@@ -100,7 +114,9 @@ private struct MenuBarView: View {
                 Spacer()
                 Picker("识别模型", selection: $settings.recognitionProvider) {
                     Text("Apple 本地识别").tag(RecognitionProvider.apple)
-                    Text("豆包语音 2.0").tag(RecognitionProvider.doubao)
+                    Text(settings.hasDoubaoKey ? "豆包语音 2.0" : "豆包语音 2.0（先配置密钥）")
+                        .tag(RecognitionProvider.doubao)
+                        .disabled(!settings.hasDoubaoKey)
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
@@ -281,7 +297,9 @@ private struct SettingsView: View {
             Section("语音识别模型") {
                 Picker("首选模型", selection: $settings.recognitionProvider) {
                     Text("Apple 本地识别").tag(RecognitionProvider.apple)
-                    Text("豆包语音 2.0").tag(RecognitionProvider.doubao)
+                    Text(settings.hasDoubaoKey ? "豆包语音 2.0" : "豆包语音 2.0（先配置密钥）")
+                        .tag(RecognitionProvider.doubao)
+                        .disabled(!settings.hasDoubaoKey)
                 }
                 .onChange(of: settings.recognitionProvider) { _, _ in
                     model.refreshModelCapability()

@@ -24,7 +24,14 @@ final class AppSettings: ObservableObject {
     @Published var listenPortText: String { didSet { save() } }
     @Published var token: String { didSet { save() } }
     @Published var locale: String { didSet { save() } }
-    @Published var recognitionProvider: RecognitionProvider { didSet { save() } }
+    @Published var recognitionProvider: RecognitionProvider {
+        didSet {
+            if recognitionProvider == .doubao && !hasDoubaoKey {
+                recognitionProvider = .apple
+            }
+            save()
+        }
+    }
     @Published var modelSelectionMode: ModelSelectionMode { didSet { save() } }
     @Published var doubaoResourceID: String { didSet { save() } }
     @Published var doubaoAPIKey: String {
@@ -34,6 +41,9 @@ final class AppSettings: ObservableObject {
                 doubaoCredentialStatus = "钥匙串保存失败（\(result)）"
             } else {
                 doubaoCredentialStatus = doubaoAPIKey.isEmpty ? "未配置" : "已保存在本机钥匙串"
+            }
+            if !hasDoubaoKey && recognitionProvider == .doubao {
+                recognitionProvider = .apple
             }
         }
     }
@@ -95,6 +105,11 @@ final class AppSettings: ObservableObject {
         )
         deviceID = defaults.string(forKey: "deviceID").flatMap(UUID.init(uuidString:)) ?? UUID()
         defaults.set(deviceID.uuidString, forKey: "deviceID")
+        if storedDoubaoKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+           recognitionProvider == .doubao {
+            recognitionProvider = .apple
+            defaults.set(RecognitionProvider.apple.rawValue, forKey: "recognitionProvider")
+        }
     }
 
     func addTarget() {
