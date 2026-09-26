@@ -22,8 +22,8 @@ if [[ -z "$SDK" ]]; then
 fi
 
 APP="$ROOT/dist/语音输入共享.app"
-ZIP="$ROOT/dist/语音输入共享-macOS14-arm64.zip"
-DMG="$ROOT/dist/语音输入共享-macOS14-arm64.dmg"
+ZIP="$ROOT/dist/inputbridge-macOS14-arm64.zip"
+DMG="$ROOT/dist/inputbridge-macOS14-arm64.dmg"
 mkdir -p "$ROOT/.build/module-cache" "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon-liquid-micwave-v2.icns" "$APP/Contents/Resources/AppIcon.icns"

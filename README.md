@@ -56,7 +56,7 @@ zsh Scripts/package.sh --local-only
 zsh Scripts/package.sh
 ```
 
-产物是 `dist/语音输入共享.app`、`dist/语音输入共享-macOS14-arm64.dmg` 和 `dist/语音输入共享-macOS14-arm64.zip`。其他 Mac 首次安装请打开 DMG，将 App 拖入“应用程序”；ZIP 专供 App 内自动更新。程序目标最低版本是 macOS 14；macOS 26 优先使用新的 `SpeechTranscriber`，不支持时回退到 `DictationTranscriber`；macOS 14–15 使用旧版 Apple Speech 设备端接口。能否用于所选语言取决于系统提供的本地资源。
+产物是 `dist/语音输入共享.app`、`dist/inputbridge-macOS14-arm64.dmg` 和 `dist/inputbridge-macOS14-arm64.zip`。其他 Mac 首次安装请打开 DMG，将 App 拖入“应用程序”；ZIP 专供 App 内自动更新。程序目标最低版本是 macOS 14；macOS 26 优先使用新的 `SpeechTranscriber`，不支持时回退到 `DictationTranscriber`；macOS 14–15 使用旧版 Apple Speech 设备端接口。能否用于所选语言取决于系统提供的本地资源。
 
 当前构建机没有 Developer ID 证书，脚本会生成临时签名。其他 Mac 首次打开可能需要在“系统设置 → 隐私与安全性”中允许。正式分发时，在有 Developer ID 证书的构建机上设置 `SIGN_IDENTITY` 与 `NOTARY_PROFILE`，脚本会签名、公证并装订。
 
@@ -89,7 +89,7 @@ zsh Scripts/package.sh
 
 ## GitHub 更新
 
-设置里的“自动更新”按钮从 [GitHub Releases](https://github.com/xiao7477/inputbridge/releases) 读取最新正式版，下载 `语音输入共享-macOS14-arm64.zip`，对照发布资产的 SHA-256 摘要校验，再核对 App 标识、版本与代码签名。安装完成后会重启。当前 App 所在目录不可写时，新版安装到当前用户的 `~/Applications`；原 App 会保留，之后从新位置运行。
+设置里的“自动更新”按钮从 [GitHub Releases](https://github.com/xiao7477/inputbridge/releases) 读取最新正式版，下载 `inputbridge-macOS14-arm64.zip`，对照发布资产的 SHA-256 摘要校验，再核对 App 标识、版本与代码签名。安装完成后会重启。当前 App 所在目录不可写时，新版安装到当前用户的 `~/Applications`；原 App 会保留，之后从新位置运行。
 
 本仓库的 [GitHub Actions 发布流程](.github/workflows/release.yml) 会在 `main` 的 App 源码、构建脚本或版本号发生变化时，用 macOS 26 Arm64 构建 ZIP 和 DMG，并以 `Resources/Info.plist` 的版本号创建或更新正式 Release。**发布下一版前必须递增 `CFBundleShortVersionString` 与 `CFBundleVersion`**；版本号未变时，其他电脑的更新按钮会正确地提示“已是最新版本”。旧版 App 没有更新按钮，第一次仍需用 DMG 手动安装。两台 Mac 更新到同一 App 版本后再远程配对。
 

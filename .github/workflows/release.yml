@@ -34,5 +34,5 @@ jobs:
               --notes '语音输入共享 macOS 安装包。DMG 用于首次安装，ZIP 用于 App 内自动更新。'
           fi
           gh release upload "$tag" \
-            'dist/语音输入共享-macOS14-arm64.zip' \
-            'dist/语音输入共享-macOS14-arm64.dmg' --clobber
+            'dist/inputbridge-macOS14-arm64.zip' \
+            'dist/inputbridge-macOS14-arm64.dmg' --clobber

@@ -8,7 +8,7 @@ final class GitHubUpdater: ObservableObject {
     @Published private(set) var isRunning = false
 
     private let repository = "xiao7477/inputbridge"
-    private let assetName = "语音输入共享-macOS14-arm64.zip"
+    private let assetName = "inputbridge-macOS14-arm64.zip"
 
     func checkAndInstall() async {
         guard !isRunning else { return }
