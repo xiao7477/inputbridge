@@ -1,0 +1,6 @@
+.build/
+dist/
+.DS_Store
+Resources/AppIcon*.png
+Resources/AppIcon*.icns
+!Resources/AppIcon-liquid-micwave-v2.icns

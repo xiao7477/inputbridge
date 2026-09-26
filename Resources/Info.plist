@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+    <key>CFBundleExecutable</key><string>InputBridge</string>
+    <key>CFBundleIdentifier</key><string>com.inputbridge.macos</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>语音输入共享</string>
+    <key>CFBundleDisplayName</key><string>语音输入共享</string>
+    <key>CFBundleIconFile</key><string>AppIcon.icns</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.11.0</string>
+    <key>CFBundleVersion</key><string>26</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSMicrophoneUsageDescription</key><string>按住快捷键时使用麦克风，在这台 Mac 上将语音转为文字。</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>使用 Apple 设备端语音识别，将讲话实时转为文字。</string>
+    <key>NSLocalNetworkUsageDescription</key><string>连接同一局域网或 Tailscale 网络中的另一台 Mac，实时传送语音音频。</string>
+    <key>NSHumanReadableCopyright</key><string>Copyright © 2026 语音输入共享.</string>
+</dict>
+</plist>

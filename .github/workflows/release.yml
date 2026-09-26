@@ -1,0 +1,38 @@
+name: Publish macOS App
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Sources/**'
+      - 'Resources/Info.plist'
+      - 'Resources/AppIcon-liquid-micwave-v2.icns'
+      - 'Scripts/**'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build signed test App, update ZIP and installer DMG
+        run: zsh Scripts/package.sh
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)
+          tag="v${version}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" \
+              --notes '语音输入共享 macOS 安装包。DMG 用于首次安装，ZIP 用于 App 内自动更新。'
+          fi
+          gh release upload "$tag" \
+            'dist/语音输入共享-macOS14-arm64.zip' \
+            'dist/语音输入共享-macOS14-arm64.dmg' --clobber
