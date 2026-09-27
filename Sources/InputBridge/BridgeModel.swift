@@ -59,8 +59,10 @@ final class BridgeModel: ObservableObject {
     private var remoteReadyTimeout: Task<Void, Never>?
     private var remoteFinishTimeout: Task<Void, Never>?
     private var remoteCaptureStopSeconds: TimeInterval?
+    private var remoteStopRequestedAt: TimeInterval?
     private var remoteEndSentAt: Date?
     private var remoteEndArrivalSeconds: TimeInterval?
+    private var incomingEndRequestedElapsedSeconds: TimeInterval?
     private var incomingFailed = false
     private var remoteCapability: ModelCapability?
     private let fallbackLoginAgentLabel = "com.inputbridge.macos.autostart"
@@ -139,13 +141,17 @@ final class BridgeModel: ObservableObject {
         hotkey.onPress = { [weak self] in
             Task { @MainActor in await self?.beginDictation() }
         }
-        hotkey.onRelease = { [weak self] in
-            Task { @MainActor in await self?.endDictation() }
+        hotkey.onRelease = { [weak self] eventTimestamp in
+            let requestedAt = eventTimestamp ?? ProcessInfo.processInfo.systemUptime
+            Task { @MainActor in await self?.endDictation(requestedAt: requestedAt) }
         }
-        hotkey.onToggle = { [weak self] in
+        hotkey.onToggle = { [weak self] eventTimestamp in
+            let requestedAt = eventTimestamp ?? ProcessInfo.processInfo.systemUptime
             Task { @MainActor in
                 guard let self else { return }
-                if self.isRecording || self.isStarting { await self.endDictation() }
+                if self.isRecording || self.isStarting {
+                    await self.endDictation(requestedAt: requestedAt)
+                }
                 else { await self.beginDictation() }
             }
         }
@@ -455,6 +461,7 @@ final class BridgeModel: ObservableObject {
         }
         isStarting = true
         releaseRequested = false
+        remoteStopRequestedAt = nil
         defer { isStarting = false }
         do {
             let route = try await resolveOutputRoute()
@@ -525,14 +532,17 @@ final class BridgeModel: ObservableObject {
         }
     }
 
-    func endDictation() async {
+    func endDictation(requestedAt: TimeInterval? = nil) async {
+        let stopRequestedAt = requestedAt ?? ProcessInfo.processInfo.systemUptime
         if isStarting && !isRecording {
             releaseRequested = true
+            remoteStopRequestedAt = remoteStopRequestedAt ?? stopRequestedAt
             isFinishingDictation = true
             updateHotkeyAvailability()
             return
         }
         guard isRecording else { return }
+        remoteStopRequestedAt = remoteStopRequestedAt ?? stopRequestedAt
         isRecording = false
         isFinishingDictation = true
         updateHotkeyAvailability()
@@ -549,7 +559,10 @@ final class BridgeModel: ObservableObject {
             remoteCaptureStopSeconds = Date().timeIntervalSince(captureStopStarted)
             guard self.outgoingSession == outgoingSession else { return }
             do {
-                try client.send(makeMessage(session: outgoingSession, type: .audioEnd))
+                let elapsed = max(0, ProcessInfo.processInfo.systemUptime -
+                                  (remoteStopRequestedAt ?? stopRequestedAt))
+                try client.send(makeMessage(session: outgoingSession, type: .audioEnd,
+                                            endRequestedElapsedSeconds: elapsed))
                 remoteEndSentAt = Date()
                 speechStatus = "等待 B 完成识别和写入…"
                 remoteFinishTimeout?.cancel()
@@ -600,12 +613,14 @@ final class BridgeModel: ObservableObject {
                              text: String = "", audio: Data? = nil,
                              modelRequest: ModelRequest? = nil,
                              modelDecision: ModelDecision? = nil,
-                             modelCapability: ModelCapability? = nil) -> TextMessage {
+                             modelCapability: ModelCapability? = nil,
+                             endRequestedElapsedSeconds: TimeInterval? = nil) -> TextMessage {
         TextMessage(sessionId: session, type: type, text: text, audio: audio,
                     token: settings.token,
                     senderID: settings.deviceID, senderName: settings.deviceName,
                     modelRequest: modelRequest, modelDecision: modelDecision,
-                    modelCapability: modelCapability)
+                    modelCapability: modelCapability,
+                    endRequestedElapsedSeconds: endRequestedElapsedSeconds)
     }
 
     private func resolveOutputRoute() async throws -> OutputRoute {
@@ -852,6 +867,7 @@ final class BridgeModel: ObservableObject {
                 incomingAudioReady = false
                 incomingFailed = false
                 incomingProgress = RemoteInputProgress()
+                incomingEndRequestedElapsedSeconds = nil
                 pendingTranscript = nil
                 pendingIncomingAudio.removeAll(keepingCapacity: true)
                 pendingIncomingAudioBytes = 0
@@ -939,6 +955,7 @@ final class BridgeModel: ObservableObject {
             case .audioEnd:
                 guard incomingSession == message.sessionId,
                       activeConnectionID == connectionID else { return }
+                incomingEndRequestedElapsedSeconds = message.endRequestedElapsedSeconds
                 receiverStatus = "已收到结束信号，正在完成远程识别…"
                 publishIncomingProgress(force: true)
                 let sessionID = message.sessionId
@@ -994,8 +1011,11 @@ final class BridgeModel: ObservableObject {
             : "远程听写已结束"
         let timing = String(format: "B 识别收尾 %.1f 秒 · B 写入收尾 %.1f 秒",
                             recognitionSeconds, writeSeconds)
+        let controllerTiming = incomingEndRequestedElapsedSeconds.map {
+            String(format: "A 结束操作→发出信号 %.1f 秒 · ", $0)
+        } ?? ""
         publishIncomingProgress(force: true)
-        remoteProgressStatus = "\(receiverStatus) · \(timing) · \(incomingProgress.summary)"
+        remoteProgressStatus = "\(receiverStatus) · \(controllerTiming)\(timing) · \(incomingProgress.summary)"
         try? server.send(TextMessage(sessionId: sessionID, type: .audioComplete,
                                     token: settings.token, senderID: settings.deviceID,
                                     senderName: settings.deviceName,
@@ -1052,6 +1072,7 @@ final class BridgeModel: ObservableObject {
         pendingTranscript = nil
         incomingStartTask = nil
         incomingAudioReady = false
+        incomingEndRequestedElapsedSeconds = nil
         pendingIncomingAudio.removeAll(keepingCapacity: false)
         pendingIncomingAudioBytes = 0
         incomingSession = nil
@@ -1101,6 +1122,7 @@ final class BridgeModel: ObservableObject {
         remoteReadyTimeout?.cancel()
         remoteFinishTimeout?.cancel()
         remoteCaptureStopSeconds = nil
+        remoteStopRequestedAt = nil
         remoteEndSentAt = nil
         remoteEndArrivalSeconds = nil
         remoteReadyContinuation?.resume(throwing: BridgeError.transport("远程听写已结束。"))
@@ -1144,13 +1166,16 @@ final class BridgeModel: ObservableObject {
                 overlay.show(label: "B 正在写入文字", style: .remote, animate: false)
             }
         case .audioComplete:
+            let total = remoteStopRequestedAt.map {
+                String(format: "A 结束操作→完全结束 %.1f 秒", max(0, ProcessInfo.processInfo.systemUptime - $0))
+            }
             let capture = remoteCaptureStopSeconds.map {
                 String(format: "A 录音收尾 %.1f 秒", $0)
             }
             let transit = remoteEndArrivalSeconds.map {
-                String(format: "结束信号到 B %.1f 秒", $0)
+                String(format: "A 发出→B 确认 %.1f 秒", $0)
             }
-            remoteProgressStatus = ([capture, transit, message.reason].compactMap { $0 })
+            remoteProgressStatus = ([total, capture, transit, message.reason].compactMap { $0 })
                 .joined(separator: " · ")
             clearOutgoingRemoteSession()
             speechStatus = readySpeechStatus

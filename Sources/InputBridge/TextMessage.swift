@@ -20,11 +20,14 @@ struct TextMessage: Codable {
     let modelRequest: ModelRequest?
     let modelDecision: ModelDecision?
     let modelCapability: ModelCapability?
+    /// Time on A from the user's stop action until A queued the audio-end message.
+    let endRequestedElapsedSeconds: TimeInterval?
 
     init(sessionId: UUID, type: MessageKind, text: String = "", audio: Data? = nil, token: String,
          senderID: UUID, senderName: String, reason: String? = nil,
          modelRequest: ModelRequest? = nil, modelDecision: ModelDecision? = nil,
-         modelCapability: ModelCapability? = nil) {
+         modelCapability: ModelCapability? = nil,
+         endRequestedElapsedSeconds: TimeInterval? = nil) {
         self.version = Self.version
         self.sessionId = sessionId
         self.type = type
@@ -37,6 +40,7 @@ struct TextMessage: Codable {
         self.modelRequest = modelRequest
         self.modelDecision = modelDecision
         self.modelCapability = modelCapability
+        self.endRequestedElapsedSeconds = endRequestedElapsedSeconds
     }
 }
 

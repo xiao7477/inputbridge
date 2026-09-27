@@ -5,8 +5,8 @@ import Foundation
 @MainActor
 final class GlobalHotkeyManager {
     var onPress: (() -> Void)?
-    var onRelease: (() -> Void)?
-    var onToggle: (() -> Void)?
+    var onRelease: ((TimeInterval?) -> Void)?
+    var onToggle: ((TimeInterval?) -> Void)?
     var onCancel: (() -> Bool)?
     var onCapture: ((GlobalShortcut?) -> Void)?
     var onMonitorFailure: ((String) -> Void)?
@@ -195,7 +195,7 @@ final class GlobalHotkeyManager {
                     compatibilityNativeHandled = true
                 }
                 markNativeTriggerIfNeeded(signals)
-                act(on: signals)
+                act(on: signals, event: event)
             }
             return Unmanaged.passUnretained(event)
         }
@@ -205,7 +205,7 @@ final class GlobalHotkeyManager {
             if type == .keyDown {
                 act(on: matcher.keyChanged(code: code, isDown: true,
                                            isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
-                                           shortcut: shortcut, mode: mode))
+                                           shortcut: shortcut, mode: mode), event: event)
             }
             return Unmanaged.passUnretained(event)
         }
@@ -218,13 +218,13 @@ final class GlobalHotkeyManager {
             guard !signals.isEmpty else { return Unmanaged.passUnretained(event) }
             consumingKey = true
             markNativeTriggerIfNeeded(signals)
-            act(on: signals)
+            act(on: signals, event: event)
             return nil
         }
         let wasConsuming = consumingKey
         consumingKey = false
         act(on: matcher.keyChanged(code: code, isDown: false, isRepeat: false,
-                                   shortcut: shortcut, mode: mode))
+                                   shortcut: shortcut, mode: mode), event: event)
         return wasConsuming ? nil : Unmanaged.passUnretained(event)
     }
 
@@ -261,7 +261,7 @@ final class GlobalHotkeyManager {
     }
 
     private func resetTrigger() {
-        if matcher.holdActive { onRelease?() }
+        if matcher.holdActive { onRelease?(nil) }
         matcher.reset()
         consumingKey = false
         pendingHold?.cancel()
@@ -283,7 +283,7 @@ final class GlobalHotkeyManager {
         guard !capturing else { return }
         let isDown = isShortcutPhysicallyDown()
         if !isDown {
-            if compatibilityTriggered, mode == .hold { onRelease?() }
+            if compatibilityTriggered, mode == .hold { onRelease?(nil) }
             resetCompatibilityState()
             return
         }
@@ -297,7 +297,7 @@ final class GlobalHotkeyManager {
         guard Date().timeIntervalSince(compatibilityDownSince) >= delay else { return }
         compatibilityTriggered = true
         if mode == .hold { onPress?() }
-        else { onToggle?() }
+        else { onToggle?(nil) }
     }
 
     private func handleEscape(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -364,12 +364,12 @@ final class GlobalHotkeyManager {
         compatibilityDownSince = nil
     }
 
-    private func act(on signals: [HotkeySignal]) {
+    private func act(on signals: [HotkeySignal], event: CGEvent? = nil) {
         for signal in signals {
             switch signal {
             case .press: onPress?()
-            case .release: onRelease?()
-            case .toggle: onToggle?()
+            case .release: onRelease?(eventTimestamp(event))
+            case .toggle: onToggle?(eventTimestamp(event))
             case .cancelModifierHold:
                 pendingHold?.cancel()
                 pendingHold = nil
@@ -383,6 +383,13 @@ final class GlobalHotkeyManager {
                 }
             }
         }
+    }
+
+    private func eventTimestamp(_ event: CGEvent?) -> TimeInterval? {
+        guard let event, let timestamp = NSEvent(cgEvent: event)?.timestamp else { return nil }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard timestamp > 0, timestamp <= now, now - timestamp < 60 else { return nil }
+        return timestamp
     }
 
     deinit {

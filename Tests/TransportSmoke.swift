@@ -49,7 +49,8 @@ struct TransportSmoke {
             TextMessage(sessionId: sessionA, type: .audioChunk, audio: audioPacket,
                         token: token, senderID: controllerA, senderName: "Mac A"),
             TextMessage(sessionId: sessionA, type: .audioEnd, token: token,
-                        senderID: controllerA, senderName: "Mac A"),
+                        senderID: controllerA, senderName: "Mac A",
+                        endRequestedElapsedSeconds: 4.25),
             TextMessage(sessionId: sessionB, type: .audioStart, token: token,
                         senderID: controllerB, senderName: "Mac B"),
             TextMessage(sessionId: sessionB, type: .audioEnd, token: token,
@@ -71,6 +72,8 @@ struct TransportSmoke {
             .audioStart, .audioChunk, .audioEnd
         ])
         precondition(received.first { $0.type == .audioChunk }?.audio == audioPacket)
+        precondition(received.first { $0.type == .audioEnd && $0.senderID == controllerA }?
+            .endRequestedElapsedSeconds == 4.25)
         precondition(received.first { $0.type == .audioStart && $0.senderID == controllerA }?.modelRequest == modelRequest)
         precondition(received.filter { $0.senderID == controllerB }.map(\.type) == [
             .audioStart, .audioEnd
