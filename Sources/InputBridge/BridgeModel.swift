@@ -40,6 +40,7 @@ final class BridgeModel: ObservableObject {
     private var outgoingSession: UUID?
     private var incomingSession: UUID?
     private var isStarting = false
+    private var isFinishingDictation = false
     private var releaseRequested = false
     private var autoRouteTask: Task<Void, Never>?
     private var readySpeechStatus = "就绪"
@@ -500,6 +501,7 @@ final class BridgeModel: ObservableObject {
                 try await remoteAudioCapture.start(microphoneUID: settings.microphoneUID)
             }
             isRecording = true
+            hotkey.setInterceptionActive(true)
             overlay.show(style: route.overlayStyle)
             speechStatus = route.isLocal
                 ? "正在本机听写…"
@@ -516,6 +518,9 @@ final class BridgeModel: ObservableObject {
             outgoingSession = nil
             activeOutputRoute = nil
             overlay.hide()
+            hotkey.setInterceptionActive(false)
+            isFinishingDictation = false
+            updateHotkeyAvailability()
             fail(error)
         }
     }
@@ -523,12 +528,18 @@ final class BridgeModel: ObservableObject {
     func endDictation() async {
         if isStarting && !isRecording {
             releaseRequested = true
+            isFinishingDictation = true
+            updateHotkeyAvailability()
             return
         }
         guard isRecording else { return }
         isRecording = false
+        isFinishingDictation = true
+        updateHotkeyAvailability()
+        hotkey.setInterceptionActive(false)
         speechStatus = "正在结束…"
-        overlay.show(label: "正在完成", style: activeOutputRoute?.overlayStyle ?? .local)
+        overlay.show(label: "正在完成", style: activeOutputRoute?.overlayStyle ?? .local,
+                     animate: false)
         if activeOutputRoute?.isLocal == true {
             await speech.stop()
             injector.end()
@@ -557,6 +568,9 @@ final class BridgeModel: ObservableObject {
         outgoingSession = nil
         activeOutputRoute = nil
         overlay.hide()
+        hotkey.setInterceptionActive(false)
+        isFinishingDictation = false
+        updateHotkeyAvailability()
         speechStatus = readySpeechStatus
         updateIdleRouteStatus()
     }
@@ -669,12 +683,13 @@ final class BridgeModel: ObservableObject {
     }
 
     private func updateHotkeyAvailability() {
-        let shouldEnable = !isPassiveReceiver
+        let passive = isPassiveReceiver
+        let shouldEnable = !passive && !isFinishingDictation
         if !shouldEnable, isCapturingShortcut {
             isCapturingShortcut = false
         }
         hotkey.setEnabled(shouldEnable)
-        if !shouldEnable, isRecording || isStarting {
+        if passive, isRecording || isStarting {
             Task { @MainActor in await endDictation() }
         }
     }
@@ -1094,6 +1109,9 @@ final class BridgeModel: ObservableObject {
         activeOutputRoute = nil
         isRecording = false
         overlay.hide()
+        hotkey.setInterceptionActive(false)
+        isFinishingDictation = false
+        updateHotkeyAvailability()
         updateIdleRouteStatus()
     }
 
@@ -1123,7 +1141,7 @@ final class BridgeModel: ObservableObject {
             }
             remoteProgressStatus = reason
             if !isRecording, reason.hasPrefix("B 已完成识别") {
-                overlay.show(label: "B 正在写入文字", style: .remote)
+                overlay.show(label: "B 正在写入文字", style: .remote, animate: false)
             }
         case .audioComplete:
             let capture = remoteCaptureStopSeconds.map {

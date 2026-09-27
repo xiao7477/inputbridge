@@ -11,10 +11,11 @@ final class VoiceOverlayController {
     private let state = VoiceOverlayState()
     private var panel: NSPanel?
 
-    func show(label: String = "正在听写", style: VoiceOverlayStyle = .local) {
+    func show(label: String = "正在听写", style: VoiceOverlayStyle = .local,
+              animate: Bool = true) {
         state.label = label
         state.style = style
-        state.isAnimating = true
+        state.isAnimating = animate
         if panel == nil {
             let panel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 184, height: 54),

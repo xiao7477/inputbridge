@@ -13,12 +13,14 @@ final class GlobalHotkeyManager {
 
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
+    private var tapOptions: CGEventTapOptions?
     private var shortcut: GlobalShortcut = .defaultShortcut
     private var mode: ShortcutActivationMode = .hold
     private var matcher = ShortcutMatcher()
     private var captureState = ShortcutCaptureState()
     private var pendingHold: Task<Void, Never>?
     private var capturing = false
+    private var interceptingDictation = false
     private var captureStartedAt: Date?
     private var tapTimeouts: [Date] = []
     private var consumingKey = false
@@ -36,16 +38,29 @@ final class GlobalHotkeyManager {
         guard newShortcut.isValid else {
             throw BridgeError.transport("请设置一个按键或按键组合。")
         }
-        try ensureTap()
+        let previousShortcut = shortcut
+        shortcut = newShortcut
+        do {
+            try ensureTap(options: preferredTapOptions)
+        } catch {
+            shortcut = previousShortcut
+            throw error
+        }
         tapTimeouts.removeAll()
         resetTrigger()
         resetCompatibilityState()
-        shortcut = newShortcut
     }
 
     func setActivationMode(_ newMode: ShortcutActivationMode) {
         resetTrigger()
         mode = newMode
+    }
+
+    func setInterceptionActive(_ active: Bool) {
+        guard interceptingDictation != active else { return }
+        interceptingDictation = active
+        do { try ensureTap(options: preferredTapOptions) }
+        catch { onMonitorFailure?(error.localizedDescription) }
     }
 
     func setEnabled(_ newValue: Bool) {
@@ -59,7 +74,7 @@ final class GlobalHotkeyManager {
     }
 
     func beginCapture() throws {
-        try ensureTap()
+        try ensureTap(options: .defaultTap)
         resetTrigger()
         resetCompatibilityState()
         captureState = ShortcutCaptureState()
@@ -74,10 +89,18 @@ final class GlobalHotkeyManager {
         capturing = false
         captureStartedAt = nil
         suppressUntilModifiersReleased = suppressUntilRelease
+        do { try ensureTap(options: preferredTapOptions) }
+        catch { onMonitorFailure?(error.localizedDescription) }
     }
 
-    private func ensureTap() throws {
-        if let tap {
+    private var preferredTapOptions: CGEventTapOptions {
+        // A modifier-only shortcut has no character key to suppress. A passive tap
+        // observes it without taking ownership of keyboard events from other apps.
+        shortcut.keyCode == nil && !interceptingDictation ? .listenOnly : .defaultTap
+    }
+
+    private func ensureTap(options: CGEventTapOptions) throws {
+        if let tap, tapOptions == options {
             if enabled, !CGEvent.tapIsEnabled(tap: tap) {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
@@ -92,7 +115,7 @@ final class GlobalHotkeyManager {
         guard let newTap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .defaultTap,
+            options: options,
             eventsOfInterest: mask,
             callback: { _, type, event, context in
                 guard let context else { return Unmanaged.passUnretained(event) }
@@ -105,8 +128,11 @@ final class GlobalHotkeyManager {
         ), let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, newTap, 0) else {
             throw BridgeError.permission("无法启用全局快捷键监听。请检查辅助功能权限并重新启动 App。")
         }
+        if let tapSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), tapSource, .commonModes) }
+        if let tap { CFMachPortInvalidate(tap) }
         tap = newTap
         tapSource = source
+        tapOptions = options
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: newTap, enable: enabled)
         startCompatibilityTimer()
