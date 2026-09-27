@@ -57,6 +57,9 @@ final class BridgeModel: ObservableObject {
     private var remoteReadyContinuation: CheckedContinuation<Void, Error>?
     private var remoteReadyTimeout: Task<Void, Never>?
     private var remoteFinishTimeout: Task<Void, Never>?
+    private var remoteCaptureStopSeconds: TimeInterval?
+    private var remoteEndSentAt: Date?
+    private var remoteEndArrivalSeconds: TimeInterval?
     private var incomingFailed = false
     private var remoteCapability: ModelCapability?
     private let fallbackLoginAgentLabel = "com.inputbridge.macos.autostart"
@@ -526,10 +529,13 @@ final class BridgeModel: ObservableObject {
             await speech.stop()
             injector.end()
         } else if activeOutputRoute != nil, let outgoingSession {
+            let captureStopStarted = Date()
             await remoteAudioCapture.stop()
+            remoteCaptureStopSeconds = Date().timeIntervalSince(captureStopStarted)
             guard self.outgoingSession == outgoingSession else { return }
             do {
                 try client.send(makeMessage(session: outgoingSession, type: .audioEnd))
+                remoteEndSentAt = Date()
                 speechStatus = "等待 B 完成识别和写入…"
                 remoteFinishTimeout?.cancel()
                 remoteFinishTimeout = Task { [weak self] in
@@ -914,6 +920,8 @@ final class BridgeModel: ObservableObject {
             case .audioEnd:
                 guard incomingSession == message.sessionId,
                       activeConnectionID == connectionID else { return }
+                receiverStatus = "已收到结束信号，正在完成远程识别…"
+                publishIncomingProgress(force: true)
                 let sessionID = message.sessionId
                 Task { @MainActor [weak self] in
                     await self?.finishIncomingAudio(sessionID: sessionID,
@@ -939,7 +947,9 @@ final class BridgeModel: ObservableObject {
               activeConnectionID == connectionID,
               !isStoppingIncoming else { return }
         isStoppingIncoming = true
-        receiverStatus = "正在完成远程识别…"
+        let finishStarted = Date()
+        receiverStatus = "B 正在完成识别…"
+        publishIncomingProgress(force: true)
         if let incomingStartTask { await incomingStartTask.value }
         guard incomingSession == sessionID,
               activeConnectionID == connectionID else {
@@ -949,7 +959,12 @@ final class BridgeModel: ObservableObject {
         if incomingAudioReady {
             await speech.stop()
         }
+        let recognitionSeconds = Date().timeIntervalSince(finishStarted)
+        receiverStatus = "B 已完成识别，正在写入文字…"
+        publishIncomingProgress(force: true)
+        let writeStarted = Date()
         if let incomingTranscriptTask { await incomingTranscriptTask.value }
+        let writeSeconds = Date().timeIntervalSince(writeStarted)
         guard incomingSession == sessionID else { return }
         if incomingFailed {
             clearIncomingAudioSession()
@@ -958,11 +973,14 @@ final class BridgeModel: ObservableObject {
         receiverStatus = incomingProgress.recognizedCharacters == 0
             ? "音频已结束，但未识别到文字"
             : "远程听写已结束"
+        let timing = String(format: "B 识别收尾 %.1f 秒 · B 写入收尾 %.1f 秒",
+                            recognitionSeconds, writeSeconds)
         publishIncomingProgress(force: true)
+        remoteProgressStatus = "\(receiverStatus) · \(timing) · \(incomingProgress.summary)"
         try? server.send(TextMessage(sessionId: sessionID, type: .audioComplete,
                                     token: settings.token, senderID: settings.deviceID,
                                     senderName: settings.deviceName,
-                                    reason: "\(receiverStatus) · \(incomingProgress.summary)"),
+                                    reason: remoteProgressStatus),
                          to: connectionID)
         clearIncomingAudioSession()
     }
@@ -1063,6 +1081,9 @@ final class BridgeModel: ObservableObject {
     private func clearOutgoingRemoteSession() {
         remoteReadyTimeout?.cancel()
         remoteFinishTimeout?.cancel()
+        remoteCaptureStopSeconds = nil
+        remoteEndSentAt = nil
+        remoteEndArrivalSeconds = nil
         remoteReadyContinuation?.resume(throwing: BridgeError.transport("远程听写已结束。"))
         remoteReadyContinuation = nil
         outgoingSession = nil
@@ -1091,9 +1112,24 @@ final class BridgeModel: ObservableObject {
             remoteReadyContinuation?.resume()
             remoteReadyContinuation = nil
         case .audioStatus:
-            remoteProgressStatus = message.reason ?? "等待 B 端状态"
+            let reason = message.reason ?? "等待 B 端状态"
+            if reason.hasPrefix("已收到结束信号"),
+               remoteEndArrivalSeconds == nil, let remoteEndSentAt {
+                remoteEndArrivalSeconds = Date().timeIntervalSince(remoteEndSentAt)
+            }
+            remoteProgressStatus = reason
+            if !isRecording, reason.hasPrefix("B 已完成识别") {
+                overlay.show(label: "B 正在写入文字", style: .remote)
+            }
         case .audioComplete:
-            remoteProgressStatus = message.reason ?? "B 端已结束"
+            let capture = remoteCaptureStopSeconds.map {
+                String(format: "A 录音收尾 %.1f 秒", $0)
+            }
+            let transit = remoteEndArrivalSeconds.map {
+                String(format: "结束信号到 B %.1f 秒", $0)
+            }
+            remoteProgressStatus = ([capture, transit, message.reason].compactMap { $0 })
+                .joined(separator: " · ")
             clearOutgoingRemoteSession()
             speechStatus = readySpeechStatus
         case .audioError:
