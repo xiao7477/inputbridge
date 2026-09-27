@@ -106,6 +106,11 @@ final class ModernAppleSpeechEngine: SpeechEngine {
         await cleanUp()
     }
 
+    func cancel() async {
+        stopping = true
+        await cleanUp()
+    }
+
     private func prepare(locale: Locale,
                          needsMicrophone: Bool) async throws -> SelectedTranscriber {
         if needsMicrophone {

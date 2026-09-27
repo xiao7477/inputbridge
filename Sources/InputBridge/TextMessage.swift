@@ -2,12 +2,12 @@ import Foundation
 
 enum MessageKind: String, Codable {
     case hello, welcome, rejected
-    case audioStart, audioReady, audioChunk, audioEnd, audioError, audioStatus, audioComplete
+    case audioStart, audioReady, audioChunk, audioEnd, audioCancel, audioError, audioStatus, audioComplete
     case modelProbe, modelCapability
 }
 
 struct TextMessage: Codable {
-    static let version = 5
+    static let version = 6
     let version: Int
     let sessionId: UUID
     let type: MessageKind

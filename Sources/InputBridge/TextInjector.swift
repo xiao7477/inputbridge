@@ -5,6 +5,8 @@ import ApplicationServices
 final class TextInjector {
     private static var didPromptThisRun = false
     private var targetProcessID: pid_t?
+    private var localApplicationPID: pid_t?
+    private var localEditor: AXUIElement?
     private var insertedText = ""
     private var remoteApplication: AXUIElement?
     private var remoteEditor: AXUIElement?
@@ -32,10 +34,13 @@ final class TextInjector {
         }
         guard let target = focusedElement(),
               let processID = processID(of: target),
+              let applicationPID = focusedApplicationPID(),
               !isKnownNonEditable(target) else {
             throw BridgeError.noFocusedText
         }
         targetProcessID = processID
+        localApplicationPID = applicationPID
+        localEditor = target
         insertedText = ""
     }
 
@@ -103,6 +108,7 @@ final class TextInjector {
         let addition = String(text.dropFirst(prefix))
         guard deletions > 0 || !addition.isEmpty else { return }
         for _ in 0..<deletions {
+            try Task.checkCancellation()
             _ = try checkedRemoteFocus(app: app, pid: pid)
             try remoteWriter.post(51, unicode: nil, to: pid)
             try await Task.sleep(for: .milliseconds(3))
@@ -171,6 +177,16 @@ final class TextInjector {
         return focused
     }
 
+    var localFocusTarget: InputFocusTarget? {
+        guard let pid = localApplicationPID, let localEditor else { return nil }
+        return .editor(applicationPID: pid, element: localEditor)
+    }
+
+    var remoteFocusTarget: InputFocusTarget? {
+        guard let pid = remoteApplicationPID, let remoteEditor else { return nil }
+        return .editor(applicationPID: pid, element: remoteEditor)
+    }
+
     func update(_ text: String) throws {
         guard let targetProcessID else { throw BridgeError.noFocusedText }
         try checkFocus(processID: targetProcessID)
@@ -179,6 +195,8 @@ final class TextInjector {
     }
 
     func end() {
+        localApplicationPID = nil
+        localEditor = nil
         remoteApplication = nil
         remoteEditor = nil
         remoteApplicationPID = nil
@@ -190,6 +208,8 @@ final class TextInjector {
     private func checkFocus(processID: pid_t) throws {
         guard let focused = focusedElement(),
               self.processID(of: focused) == processID,
+              focusedApplicationPID() == localApplicationPID,
+              let localEditor, CFEqual(focused, localEditor),
               !isKnownNonEditable(focused) else {
             throw BridgeError.injection("输入焦点已改变，本次语音输入已停止。")
         }

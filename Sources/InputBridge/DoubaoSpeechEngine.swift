@@ -154,6 +154,14 @@ final class DoubaoSpeechEngine: SpeechEngine {
         await cleanUp()
     }
 
+    func cancel() async {
+        stopping = true
+        socket?.cancel(with: .goingAway, reason: nil)
+        audioStream?.finish()
+        await capture.stop()
+        await cleanUp()
+    }
+
     private static func decode(_ message: URLSessionWebSocketTask.Message) throws -> DoubaoASRResponse {
         switch message {
         case .data(let data): try DoubaoASRProtocol.decode(data)

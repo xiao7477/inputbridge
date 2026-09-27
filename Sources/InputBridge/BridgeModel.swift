@@ -33,6 +33,8 @@ final class BridgeModel: ObservableObject {
     private let outgoingScreenSharingMonitor = ScreenSharingMonitor()
     private let incomingScreenSharingMonitor = ScreenSharingMonitor()
     private let injector = TextInjector()
+    private let outgoingFocusMonitor = InputFocusMonitor()
+    private let incomingFocusMonitor = InputFocusMonitor()
     private let overlay = VoiceOverlayController()
     private var speech: SpeechEngine = makeAppleSpeechEngine()
     private let remoteAudioCapture = RemoteAudioCapture()
@@ -42,6 +44,7 @@ final class BridgeModel: ObservableObject {
     private var isStarting = false
     private var isFinishingDictation = false
     private var releaseRequested = false
+    private var focusCancelledSession: UUID?
     private var autoRouteTask: Task<Void, Never>?
     private var readySpeechStatus = "就绪"
     private var connectedTargetID: UUID?
@@ -92,6 +95,10 @@ final class BridgeModel: ObservableObject {
                 if self.activeOutputRoute?.isLocal == false {
                     self.remoteReadyContinuation?.resume(throwing: BridgeError.noConnection)
                     self.remoteReadyContinuation = nil
+                    self.outgoingSession = nil
+                    self.isRecording = false
+                    self.isFinishingDictation = true
+                    self.updateHotkeyAvailability()
                     Task { @MainActor in
                         await self.remoteAudioCapture.stop()
                         self.clearOutgoingRemoteSession()
@@ -461,6 +468,7 @@ final class BridgeModel: ObservableObject {
         }
         isStarting = true
         releaseRequested = false
+        focusCancelledSession = nil
         remoteStopRequestedAt = nil
         defer { isStarting = false }
         do {
@@ -477,6 +485,12 @@ final class BridgeModel: ObservableObject {
                     activeModelStatus = "Apple 本地识别（豆包未配置）"
                 }
                 try injector.begin()
+                guard let focusTarget = injector.localFocusTarget else {
+                    throw BridgeError.noFocusedText
+                }
+                outgoingFocusMonitor.start(target: focusTarget) { [weak self] in
+                    self?.outgoingFocusLost(session: session)
+                }
                 automaticRouteStatus = "正在输入到本机"
                 overlay.show(label: "准备语音输入", style: route.overlayStyle)
                 do {
@@ -495,17 +509,34 @@ final class BridgeModel: ObservableObject {
                     )
                 }
             case .remote(let target):
+                guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.ScreenSharing",
+                      let focusTarget = InputFocusTarget.frontmostWindow() else {
+                    throw BridgeError.transport("无法确认屏幕共享窗口的输入焦点。")
+                }
+                outgoingFocusMonitor.start(target: focusTarget) { [weak self] in
+                    self?.outgoingFocusLost(session: session)
+                }
                 automaticRouteStatus = "正在输入到 \(target.name)"
                 remoteProgressStatus = "正在等待 B 定位输入框并启动识别"
                 speechStatus = "等待 B 端准备…"
                 overlay.show(label: "等待远端就绪", style: route.overlayStyle)
                 try await prepareRemoteSession(session)
+                guard outgoingSession == session else { return }
                 if releaseRequested {
                     isRecording = true
                     await endDictation()
                     return
                 }
                 try await remoteAudioCapture.start(microphoneUID: settings.microphoneUID)
+            }
+            guard outgoingSession == session else {
+                if route.isLocal {
+                    await speech.cancel()
+                    injector.end()
+                } else {
+                    await remoteAudioCapture.cancel()
+                }
+                return
             }
             isRecording = true
             hotkey.setInterceptionActive(true)
@@ -516,10 +547,18 @@ final class BridgeModel: ObservableObject {
             errorMessage = ""
             if releaseRequested { await endDictation() }
         } catch {
-            if activeOutputRoute?.isLocal == true { injector.end() }
+            outgoingFocusMonitor.stop()
+            let cancelled = error is CancellationError || focusCancelledSession != nil
+            if activeOutputRoute?.isLocal == true {
+                injector.end()
+                if cancelled { await speech.cancel() }
+            }
             else if activeOutputRoute != nil, let outgoingSession {
-                await remoteAudioCapture.stop()
-                try? client.send(makeMessage(session: outgoingSession, type: .audioEnd))
+                if cancelled { await remoteAudioCapture.cancel() }
+                else {
+                    await remoteAudioCapture.stop()
+                    try? client.send(makeMessage(session: outgoingSession, type: .audioEnd))
+                }
             }
             remoteReadyTimeout?.cancel()
             outgoingSession = nil
@@ -528,11 +567,15 @@ final class BridgeModel: ObservableObject {
             hotkey.setInterceptionActive(false)
             isFinishingDictation = false
             updateHotkeyAvailability()
-            fail(error)
+            if cancelled {
+                speechStatus = "输入焦点已离开，听写已停止"
+                errorMessage = ""
+            } else { fail(error) }
         }
     }
 
     func endDictation(requestedAt: TimeInterval? = nil) async {
+        outgoingFocusMonitor.stop()
         let stopRequestedAt = requestedAt ?? ProcessInfo.processInfo.systemUptime
         if isStarting && !isRecording {
             releaseRequested = true
@@ -586,6 +629,46 @@ final class BridgeModel: ObservableObject {
         updateHotkeyAvailability()
         speechStatus = readySpeechStatus
         updateIdleRouteStatus()
+    }
+
+    private func outgoingFocusLost(session: UUID) {
+        guard outgoingSession == session, (isRecording || isStarting),
+              !isFinishingDictation else { return }
+        focusCancelledSession = session
+        outgoingFocusMonitor.stop()
+        let route = activeOutputRoute
+        let wasRecording = isRecording
+        outgoingSession = nil
+        activeOutputRoute = nil
+        isRecording = false
+        isFinishingDictation = true
+        hotkey.setInterceptionActive(false)
+        updateHotkeyAvailability()
+        remoteReadyTimeout?.cancel()
+        remoteFinishTimeout?.cancel()
+        if route?.isLocal == false {
+            remoteProgressStatus = "输入焦点已离开，远程听写已取消"
+            try? client.send(makeMessage(session: session, type: .audioCancel))
+        } else {
+            injector.end()
+        }
+        if let continuation = remoteReadyContinuation {
+            remoteReadyContinuation = nil
+            continuation.resume(throwing: CancellationError())
+        }
+        Task { @MainActor in
+            if wasRecording {
+                if route?.isLocal == true { await speech.cancel() }
+                else { await remoteAudioCapture.cancel() }
+            }
+            guard focusCancelledSession == session else { return }
+            overlay.hide()
+            isFinishingDictation = false
+            updateHotkeyAvailability()
+            automaticRouteStatus = "输入焦点已离开，听写已停止"
+            speechStatus = "输入焦点已离开，听写已停止"
+            errorMessage = ""
+        }
     }
 
     private func deliverTranscript(_ text: String, final: Bool) {
@@ -891,6 +974,19 @@ final class BridgeModel: ObservableObject {
                     do {
                         try await self.injector.beginRemote()
                         guard !Task.isCancelled, self.incomingSession == sessionID else { return }
+                        guard let focusTarget = self.injector.remoteFocusTarget else {
+                            throw BridgeError.noFocusedText
+                        }
+                        self.incomingFocusMonitor.start(target: focusTarget) { [weak self] in
+                            guard let self, self.incomingSession == sessionID else { return }
+                            Task { @MainActor in
+                                await self.cancelIncomingAudio(
+                                    sessionID: sessionID,
+                                    reason: "B 端输入焦点已离开，远程听写已停止",
+                                    notifyController: true
+                                )
+                            }
+                        }
                         self.incomingProgress.target = self.injector.targetDescription
                         self.receiverStatus = "输入框已定位，正在启动识别…"
                         self.publishIncomingProgress(force: true)
@@ -911,7 +1007,7 @@ final class BridgeModel: ObservableObject {
                         guard !Task.isCancelled,
                               self.incomingSession == sessionID,
                               self.activeConnectionID == connectionID else {
-                            await self.speech.stop()
+                            await self.speech.cancel()
                             return
                         }
                         self.incomingAudioReady = true
@@ -963,6 +1059,16 @@ final class BridgeModel: ObservableObject {
                     await self?.finishIncomingAudio(sessionID: sessionID,
                                                     connectionID: connectionID)
                 }
+            case .audioCancel:
+                guard incomingSession == message.sessionId,
+                      activeConnectionID == connectionID else { return }
+                Task { @MainActor [weak self] in
+                    await self?.cancelIncomingAudio(
+                        sessionID: message.sessionId,
+                        reason: "操作端输入焦点已离开，远程听写已停止",
+                        notifyController: false
+                    )
+                }
             case .modelProbe:
                 let snapshot = ModelCapability(preferred: settings.recognitionProvider,
                                                hasDoubaoKey: settings.hasDoubaoKey,
@@ -995,6 +1101,10 @@ final class BridgeModel: ObservableObject {
         if incomingAudioReady {
             await speech.stop()
         }
+        if incomingFailed {
+            clearIncomingAudioSession()
+            return
+        }
         let recognitionSeconds = Date().timeIntervalSince(finishStarted)
         receiverStatus = "B 已完成识别，正在写入文字…"
         publishIncomingProgress(force: true)
@@ -1024,9 +1134,38 @@ final class BridgeModel: ObservableObject {
         clearIncomingAudioSession()
     }
 
+    private func cancelIncomingAudio(sessionID: UUID, reason: String,
+                                     notifyController: Bool) async {
+        guard incomingSession == sessionID, !incomingFailed else { return }
+        incomingFailed = true
+        incomingFocusMonitor.stop()
+        incomingStartTask?.cancel()
+        incomingTranscriptTask?.cancel()
+        pendingTranscript = nil
+        let wasAlreadyStopping = isStoppingIncoming
+        isStoppingIncoming = true
+        receiverStatus = reason
+        remoteProgressStatus = reason
+        errorMessage = ""
+        if notifyController, let connectionID = activeConnectionID {
+            try? server.send(TextMessage(
+                sessionId: sessionID, type: .audioCancel,
+                token: settings.token, senderID: settings.deviceID,
+                senderName: settings.deviceName, reason: reason
+            ), to: connectionID)
+        }
+        guard !wasAlreadyStopping else { return }
+        if let incomingStartTask { await incomingStartTask.value }
+        if incomingAudioReady { await speech.cancel() }
+        guard incomingSession == sessionID else { return }
+        clearIncomingAudioSession()
+        speechStatus = readySpeechStatus
+    }
+
     private func failIncomingAudio(_ error: Error) async {
         guard incomingSession != nil, !incomingFailed else { return }
         incomingFailed = true
+        incomingFocusMonitor.stop()
         incomingStartTask?.cancel()
         incomingTranscriptTask?.cancel()
         pendingTranscript = nil
@@ -1034,10 +1173,6 @@ final class BridgeModel: ObservableObject {
         let failedConnection = activeConnectionID
         let wasAlreadyStopping = isStoppingIncoming
         isStoppingIncoming = true
-        if !wasAlreadyStopping {
-            if let incomingStartTask { await incomingStartTask.value }
-            if incomingAudioReady { await speech.stop() }
-        }
         if let failedSession, let failedConnection {
             let response = TextMessage(
                 sessionId: failedSession,
@@ -1048,6 +1183,10 @@ final class BridgeModel: ObservableObject {
                 reason: "\(error.localizedDescription) · \(incomingProgress.summary)"
             )
             try? server.send(response, to: failedConnection)
+        }
+        if !wasAlreadyStopping {
+            if let incomingStartTask { await incomingStartTask.value }
+            if incomingAudioReady { await speech.stop() }
         }
         if !wasAlreadyStopping { clearIncomingAudioSession() }
         errorMessage = error.localizedDescription
@@ -1066,6 +1205,7 @@ final class BridgeModel: ObservableObject {
     }
 
     private func clearIncomingAudioSession() {
+        incomingFocusMonitor.stop()
         injector.end()
         incomingTranscriptTask?.cancel()
         incomingTranscriptTask = nil
@@ -1119,6 +1259,7 @@ final class BridgeModel: ObservableObject {
     }
 
     private func clearOutgoingRemoteSession() {
+        outgoingFocusMonitor.stop()
         remoteReadyTimeout?.cancel()
         remoteFinishTimeout?.cancel()
         remoteCaptureStopSeconds = nil
@@ -1179,6 +1320,28 @@ final class BridgeModel: ObservableObject {
                 .joined(separator: " · ")
             clearOutgoingRemoteSession()
             speechStatus = readySpeechStatus
+        case .audioCancel:
+            let reason = message.reason ?? "输入焦点已离开，远程听写已停止"
+            remoteProgressStatus = reason
+            focusCancelledSession = message.sessionId
+            outgoingFocusMonitor.stop()
+            remoteReadyTimeout?.cancel()
+            remoteFinishTimeout?.cancel()
+            outgoingSession = nil
+            isRecording = false
+            isFinishingDictation = true
+            updateHotkeyAvailability()
+            if let continuation = remoteReadyContinuation {
+                remoteReadyContinuation = nil
+                continuation.resume(throwing: CancellationError())
+            } else {
+                Task { @MainActor in
+                    await self.remoteAudioCapture.cancel()
+                    self.clearOutgoingRemoteSession()
+                    self.speechStatus = reason
+                    self.errorMessage = ""
+                }
+            }
         case .audioError:
             let error = BridgeError.transport(message.reason ?? "B 端远程输入失败。")
             remoteProgressStatus = error.localizedDescription
@@ -1188,6 +1351,10 @@ final class BridgeModel: ObservableObject {
                 continuation.resume(throwing: error)
             } else {
                 Task { @MainActor in
+                    self.outgoingSession = nil
+                    self.isRecording = false
+                    self.isFinishingDictation = true
+                    self.updateHotkeyAvailability()
                     await self.remoteAudioCapture.stop()
                     self.clearOutgoingRemoteSession()
                     self.fail(error)

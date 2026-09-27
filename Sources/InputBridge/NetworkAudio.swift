@@ -58,6 +58,7 @@ final class RemoteAudioCapture {
     private var audioEngine: AVAudioEngine?
     private var inputContinuation: AsyncStream<SendableBuffer>.Continuation?
     private var conversionTask: Task<Void, Never>?
+    private var finishingTask: Task<Void, Never>?
 
     func start(microphoneUID: String) async throws {
         await stop()
@@ -148,15 +149,34 @@ final class RemoteAudioCapture {
     }
 
     func stop() async {
-        if let audioEngine {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
+        await finish(cancelPending: false)
+    }
+
+    func cancel() async {
+        await finish(cancelPending: true)
+    }
+
+    private func finish(cancelPending: Bool) async {
+        if let finishingTask {
+            if cancelPending { conversionTask?.cancel() }
+            await finishingTask.value
+            return
         }
-        inputContinuation?.finish()
-        await conversionTask?.value
-        audioEngine = nil
-        inputContinuation = nil
-        conversionTask = nil
+        let task = Task { @MainActor in
+            if let audioEngine {
+                audioEngine.stop()
+                audioEngine.inputNode.removeTap(onBus: 0)
+            }
+            inputContinuation?.finish()
+            if cancelPending { conversionTask?.cancel() }
+            await conversionTask?.value
+            audioEngine = nil
+            inputContinuation = nil
+            conversionTask = nil
+        }
+        finishingTask = task
+        await task.value
+        finishingTask = nil
     }
 
     private func requestMicrophonePermission() async -> Bool {

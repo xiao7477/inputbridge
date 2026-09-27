@@ -103,7 +103,7 @@ struct TransportSmoke {
 
         // Startup failure must reach A even before audioReady; completion and progress
         // remain in order and are delivered without a second pairing handshake.
-        for kind in [MessageKind.audioStatus, .audioError, .audioComplete] {
+        for kind in [MessageKind.audioStatus, .audioCancel, .audioError, .audioComplete] {
             try server.send(TextMessage(sessionId: sessionA, type: kind, token: token,
                                         senderID: UUID(), senderName: "B",
                                         reason: "B 输入框未变化"), to: connectionForA)

@@ -12,6 +12,7 @@ protocol SpeechEngine: AnyObject {
     func startNetwork(locale: Locale) async throws
     func appendNetworkAudio(_ data: Data)
     func stop() async
+    func cancel() async
 }
 
 @MainActor
@@ -84,6 +85,11 @@ final class AppleSpeechEngine: SpeechEngine {
                 }
             }
         }
+        await cleanUp()
+    }
+
+    func cancel() async {
+        stopping = true
         await cleanUp()
     }
 
