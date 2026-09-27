@@ -156,6 +156,10 @@ final class BridgeModel: ObservableObject {
         hotkey.onCapture = { [weak self] shortcut in
             self?.finishShortcutCapture(shortcut)
         }
+        hotkey.onMonitorFailure = { [weak self] message in
+            self?.errorMessage = message
+            self?.speechStatus = "快捷键监听已暂停"
+        }
         remoteAudioCapture.onPacket = { [weak self] data in
             guard let self,
                   let session = self.outgoingSession,

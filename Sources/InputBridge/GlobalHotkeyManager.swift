@@ -9,6 +9,7 @@ final class GlobalHotkeyManager {
     var onToggle: (() -> Void)?
     var onCancel: (() -> Bool)?
     var onCapture: ((GlobalShortcut?) -> Void)?
+    var onMonitorFailure: ((String) -> Void)?
 
     private var tap: CFMachPort?
     private var tapSource: CFRunLoopSource?
@@ -18,6 +19,8 @@ final class GlobalHotkeyManager {
     private var captureState = ShortcutCaptureState()
     private var pendingHold: Task<Void, Never>?
     private var capturing = false
+    private var captureStartedAt: Date?
+    private var tapTimeouts: [Date] = []
     private var consumingKey = false
     private var suppressUntilModifiersReleased = false
     private var compatibilityTimer: Timer?
@@ -34,6 +37,7 @@ final class GlobalHotkeyManager {
             throw BridgeError.transport("请设置一个按键或按键组合。")
         }
         try ensureTap()
+        tapTimeouts.removeAll()
         resetTrigger()
         resetCompatibilityState()
         shortcut = newShortcut
@@ -49,6 +53,7 @@ final class GlobalHotkeyManager {
         resetTrigger()
         resetCompatibilityState()
         capturing = false
+        captureStartedAt = nil
         enabled = newValue
         if let tap { CGEvent.tapEnable(tap: tap, enable: newValue) }
     }
@@ -59,12 +64,15 @@ final class GlobalHotkeyManager {
         resetCompatibilityState()
         captureState = ShortcutCaptureState()
         capturing = true
+        captureStartedAt = Date()
+        tapTimeouts.removeAll()
     }
 
     func endCapture(suppressUntilRelease: Bool = false) {
         resetTrigger()
         resetCompatibilityState()
         capturing = false
+        captureStartedAt = nil
         suppressUntilModifiersReleased = suppressUntilRelease
     }
 
@@ -105,7 +113,23 @@ final class GlobalHotkeyManager {
     }
 
     private func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        if type == .tapDisabledByTimeout {
+            let now = Date()
+            tapTimeouts.removeAll { now.timeIntervalSince($0) > 30 }
+            tapTimeouts.append(now)
+            if tapTimeouts.count >= 3 {
+                onMonitorFailure?("快捷键监听多次超时，已暂停以恢复系统键盘输入。请重新设置快捷键或重启 App。")
+            } else {
+                Task { [weak self] in
+                    try? await Task.sleep(for: .milliseconds(500))
+                    guard let self, self.enabled, self.tapTimeouts.count < 3,
+                          let tap = self.tap else { return }
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                }
+            }
+            return Unmanaged.passUnretained(event)
+        }
+        if type == .tapDisabledByUserInput {
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         }
@@ -113,7 +137,13 @@ final class GlobalHotkeyManager {
         else { return Unmanaged.passUnretained(event) }
         guard enabled else { return Unmanaged.passUnretained(event) }
 
-        if capturing { return capture(type: type, event: event) }
+        if capturing {
+            if let captureStartedAt, Date().timeIntervalSince(captureStartedAt) > 15 {
+                onCapture?(nil)
+                return Unmanaged.passUnretained(event)
+            }
+            return capture(type: type, event: event)
+        }
 
         let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         if (type == .keyDown || type == .keyUp), code == UInt16(kVK_Escape) {
@@ -214,7 +244,7 @@ final class GlobalHotkeyManager {
 
     private func startCompatibilityTimer() {
         guard compatibilityTimer == nil else { return }
-        let timer = Timer(timeInterval: 0.015, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkCompatibilityShortcut() }
         }
         RunLoop.main.add(timer, forMode: .common)

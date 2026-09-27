@@ -14,6 +14,7 @@ final class VoiceOverlayController {
     func show(label: String = "正在听写", style: VoiceOverlayStyle = .local) {
         state.label = label
         state.style = style
+        state.isAnimating = true
         if panel == nil {
             let panel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 184, height: 54),
@@ -36,7 +37,10 @@ final class VoiceOverlayController {
         panel?.orderFrontRegardless()
     }
 
-    func hide() { panel?.orderOut(nil) }
+    func hide() {
+        state.isAnimating = false
+        panel?.orderOut(nil)
+    }
 
     private func positionOnCurrentScreen() {
         let pointer = NSEvent.mouseLocation
@@ -53,6 +57,7 @@ final class VoiceOverlayController {
 private final class VoiceOverlayState: ObservableObject {
     @Published var label = "正在听写"
     @Published var style: VoiceOverlayStyle = .local
+    @Published var isAnimating = false
 }
 
 private struct VoiceOverlayView: View {
@@ -63,17 +68,21 @@ private struct VoiceOverlayView: View {
             Image(systemName: "mic.fill")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(state.style == .remote ? Color.yellow : Color.white)
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-                let time = timeline.date.timeIntervalSinceReferenceDate
-                HStack(alignment: .center, spacing: 2.5) {
-                    ForEach(0..<7) { index in
-                        Capsule()
-                            .fill(Color.white.opacity(0.95))
-                            .frame(width: 1.5,
-                                   height: 6 + 18 * abs(sin(time * 5 + Double(index) * 0.72)))
+            if state.isAnimating {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                    let time = timeline.date.timeIntervalSinceReferenceDate
+                    HStack(alignment: .center, spacing: 2.5) {
+                        ForEach(0..<7) { index in
+                            Capsule()
+                                .fill(Color.white.opacity(0.95))
+                                .frame(width: 1.5,
+                                       height: 6 + 18 * abs(sin(time * 5 + Double(index) * 0.72)))
+                        }
                     }
+                    .frame(height: 28)
                 }
-                .frame(height: 28)
+            } else {
+                Color.clear.frame(width: 25, height: 28)
             }
             Text(state.label)
                 .font(.system(size: 12, weight: .semibold))
