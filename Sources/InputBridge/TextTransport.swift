@@ -1,6 +1,17 @@
 import Foundation
 import Network
 
+private func bridgeTCPParameters() -> NWParameters {
+    let tcp = NWProtocolTCP.Options()
+    tcp.noDelay = true
+    tcp.enableKeepalive = true
+    tcp.keepaliveIdle = 15
+    tcp.keepaliveInterval = 5
+    tcp.keepaliveCount = 3
+    tcp.connectionTimeout = 15
+    return NWParameters(tls: nil, tcp: tcp)
+}
+
 struct ConnectedPeer: Identifiable, Equatable {
     let id: UUID              // TCP connection ID
     let deviceID: UUID
@@ -12,6 +23,8 @@ struct ConnectedPeer: Identifiable, Equatable {
 final class TextTransportClient {
     private var connection: NWConnection?
     private var authenticated = false
+    private var backlog = SendBacklog()
+    private var sendWatchdog: Task<Void, Never>?
     private let queue = DispatchQueue(label: "InputBridge.client")
     var onStatus: ((String) -> Void)?
     var onMessage: ((TextMessage) -> Void)?
@@ -22,7 +35,8 @@ final class TextTransportClient {
                  deviceID: UUID, deviceName: String) async throws {
         disconnect()
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { throw BridgeError.invalidPort }
-        let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort, using: .tcp)
+        let connection = NWConnection(host: NWEndpoint.Host(host), port: endpointPort,
+                                      using: bridgeTCPParameters())
         self.connection = connection
         authenticated = false
         onStatus?("连接中…")
@@ -75,6 +89,7 @@ final class TextTransportClient {
                 }
             }
         }
+        guard self.connection === connection else { throw BridgeError.noConnection }
         authenticated = true
         Self.receiveMessages(on: connection, buffer: Data()) { [weak self] message in
             Task { @MainActor in
@@ -122,18 +137,52 @@ final class TextTransportClient {
         guard let connection, authenticated else { throw BridgeError.noConnection }
         let data = try JSONEncoder().encode(message) + Data([0x0A])
         guard data.count <= 65_536 else { throw BridgeError.transport("单条消息过长。") }
+        let id = UUID()
+        guard backlog.insert(id, bytes: data.count, at: ProcessInfo.processInfo.systemUptime) else {
+            failSend(connection, reason: "网络音频积压，已停止听写。请检查 A 到 B 的连接后重试。")
+            throw BridgeError.transport("网络音频积压，已停止听写。")
+        }
         connection.send(content: data, completion: .contentProcessed { [weak self] error in
-            if let error {
-                Task { @MainActor in self?.onStatus?("发送失败：\(error.localizedDescription)") }
+            Task { @MainActor in
+                guard let self, self.connection === connection else { return }
+                self.backlog.complete(id)
+                if let error { self.failSend(connection, reason: error.localizedDescription) }
             }
         })
+        if sendWatchdog == nil {
+            sendWatchdog = Task { [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(1))
+                    guard !Task.isCancelled, let self, self.connection === connection else { return }
+                    if self.backlog.isExpired(at: ProcessInfo.processInfo.systemUptime) {
+                        self.failSend(connection, reason: "发送音频超时，请检查 A 到 B 的网络。")
+                        return
+                    }
+                    if self.backlog.isEmpty { self.sendWatchdog = nil; return }
+                }
+            }
+        }
     }
 
-    func disconnect() {
+    private func failSend(_ connection: NWConnection, reason: String) {
+        guard self.connection === connection else { return }
+        connection.cancel()
+        self.connection = nil
+        authenticated = false
+        backlog = SendBacklog()
+        sendWatchdog?.cancel()
+        sendWatchdog = nil
+        onStatus?("发送失败：\(reason)")
+    }
+
+    func disconnect(reason: String? = nil) {
+        sendWatchdog?.cancel()
+        sendWatchdog = nil
+        backlog = SendBacklog()
         connection?.cancel()
         connection = nil
         authenticated = false
-        onStatus?("未连接")
+        onStatus?(reason.map { "连接失败：\($0)" } ?? "未连接")
     }
 
     nonisolated private static func receiveMessages(
@@ -196,7 +245,9 @@ final class TextTransportServer {
         guard let endpointPort = NWEndpoint.Port(rawValue: port) else { throw BridgeError.invalidPort }
         generation += 1
         let currentGeneration = generation
-        let listener = try NWListener(using: .tcp, on: endpointPort)
+        let parameters = bridgeTCPParameters()
+        parameters.allowLocalEndpointReuse = true
+        let listener = try NWListener(using: parameters, on: endpointPort)
         self.listener = listener
         listener.stateUpdateHandler = { [weak self] state in
             Task { @MainActor in

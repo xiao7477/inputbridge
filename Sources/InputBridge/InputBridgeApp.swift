@@ -229,8 +229,9 @@ private struct SettingsView: View {
     }
 
     var body: some View {
-        Form {
-            Section("本机") {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+            SettingsSection("本机") {
                 Picker("识别语言", selection: $settings.locale) {
                     Text("简体中文").tag("zh-CN")
                     Text("English (US)").tag("en-US")
@@ -260,9 +261,9 @@ private struct SettingsView: View {
                     .help("重新扫描麦克风")
                 }
 
-                TextField("这台 Mac 的名称", text: $settings.deviceName)
+                SettingsTextField("这台 Mac 的名称", text: $settings.deviceName)
 
-                TextField("接收端口", text: $settings.listenPortText)
+                SettingsTextField("接收端口", text: $settings.listenPortText)
                     .onChange(of: settings.listenPortText) { _, _ in
                         model.startReceiver()
                     }
@@ -294,7 +295,7 @@ private struct SettingsView: View {
                 }
             }
 
-            Section("语音识别模型") {
+            SettingsSection("语音识别模型") {
                 Picker("首选模型", selection: $settings.recognitionProvider) {
                     Text("Apple 本地识别").tag(RecognitionProvider.apple)
                     Text(settings.hasDoubaoKey ? "豆包语音 2.0" : "豆包语音 2.0（先配置密钥）")
@@ -355,7 +356,7 @@ private struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Section("屏幕共享配对") {
+            SettingsSection("屏幕共享配对") {
                 if let address = model.outgoingScreenSharingAddress {
                     LabeledContent("当前操作目标", value: address)
 
@@ -402,7 +403,7 @@ private struct SettingsView: View {
                 }
             }
 
-            Section("已保存的远程电脑") {
+            SettingsSection("已保存的远程电脑") {
                 HStack {
                     if settings.targets.isEmpty {
                         Text("配对成功后会自动出现在这里")
@@ -433,9 +434,9 @@ private struct SettingsView: View {
                 }
 
                 if settings.selectedTarget != nil {
-                    TextField("名称", text: targetField(\.name))
-                    TextField("局域网 IP 或 Tailscale 名称", text: targetField(\.host))
-                    TextField("端口", text: targetField(\.portText))
+                    SettingsTextField("名称", text: targetField(\.name))
+                    SettingsTextField("局域网 IP 或 Tailscale 名称", text: targetField(\.host))
+                    SettingsTextField("端口", text: targetField(\.portText))
                 }
 
                 Text("通常不需要手动设置。保留这里是为了 Tailscale 名称、非默认端口等特殊网络。")
@@ -443,7 +444,7 @@ private struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("软件更新") {
+            SettingsSection("软件更新") {
                 HStack {
                     Button("自动更新") {
                         Task { await updater.checkAndInstall() }
@@ -463,7 +464,7 @@ private struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Section("详细状态") {
+            SettingsSection("详细状态") {
                 LabeledContent("App 版本", value: "\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?")（\(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?")）")
                 LabeledContent("语音识别", value: model.speechStatus)
                 LabeledContent("本次实际模型", value: model.activeModelStatus)
@@ -517,13 +518,54 @@ private struct SettingsView: View {
                 }
             }
         }
-        .formStyle(.grouped)
+            .padding(20)
+        }
+        .textFieldStyle(.roundedBorder)
         .frame(width: 620, height: 720)
         .onAppear {
             doubaoKeyDraft = settings.doubaoAPIKey
             model.refreshModelCapability()
             model.refreshMicrophones()
             model.refreshLaunchAtLoginStatus()
+        }
+    }
+}
+
+// A fixed viewport avoids the grouped Form/Settings content-size feedback loop.
+private struct SettingsSection<Content: View>: View {
+    let title: String
+    @ViewBuilder let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title).font(.headline)
+            VStack(alignment: .leading, spacing: 14) { content }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(16)
+                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+}
+
+private struct SettingsTextField: View {
+    let title: String
+    @Binding var text: String
+
+    init(_ title: String, text: Binding<String>) {
+        self.title = title
+        self._text = text
+    }
+
+    var body: some View {
+        LabeledContent(title) {
+            TextField(title, text: $text)
+                .labelsHidden()
+                .frame(width: 280)
         }
     }
 }

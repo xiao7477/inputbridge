@@ -70,6 +70,8 @@ final class GlobalHotkeyManager {
         capturing = false
         captureStartedAt = nil
         enabled = newValue
+        if newValue { startCompatibilityTimer() }
+        else { compatibilityTimer?.invalidate(); compatibilityTimer = nil }
         if let tap { CGEvent.tapEnable(tap: tap, enable: newValue) }
     }
 
@@ -269,10 +271,11 @@ final class GlobalHotkeyManager {
     }
 
     private func startCompatibilityTimer() {
-        guard compatibilityTimer == nil else { return }
+        guard enabled, compatibilityTimer == nil else { return }
         let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkCompatibilityShortcut() }
         }
+        timer.tolerance = 0.01
         RunLoop.main.add(timer, forMode: .common)
         compatibilityTimer = timer
     }

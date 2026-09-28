@@ -77,7 +77,7 @@ final class RemoteAudioCapture {
 
         let (stream, continuation) = AsyncStream.makeStream(
             of: SendableBuffer.self,
-            bufferingPolicy: .bufferingNewest(100)
+            bufferingPolicy: .bufferingOldest(100)
         )
         inputContinuation = continuation
         let callbackBox = CallbackBox(owner: self)
@@ -87,7 +87,9 @@ final class RemoteAudioCapture {
                 ? nil
                 : AVAudioConverter(from: sourceFormat, to: targetFormat)
 
+            var packets = AudioPacketBuffer()
             for await payload in stream {
+                guard !Task.isCancelled else { break }
                 let output: AVAudioPCMBuffer?
                 if let converter {
                     let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
@@ -124,14 +126,27 @@ final class RemoteAudioCapture {
                 }
 
                 guard let output, let data = NetworkAudioPCM.data(from: output) else { continue }
-                await MainActor.run { callbackBox.owner?.onPacket?(data) }
+                for packet in packets.append(data) {
+                    guard !Task.isCancelled else { break }
+                    await MainActor.run { callbackBox.owner?.onPacket?(packet) }
+                }
+            }
+            if !Task.isCancelled, let tail = packets.finish() {
+                await MainActor.run { callbackBox.owner?.onPacket?(tail) }
             }
         }
 
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: sourceFormat) {
             buffer, _ in
             if let copy = Self.copyBuffer(buffer) {
-                continuation.yield(SendableBuffer(buffer: copy))
+                if case .dropped = continuation.yield(SendableBuffer(buffer: copy)) {
+                    continuation.finish()
+                    Task { @MainActor in
+                        callbackBox.owner?.onError?(BridgeError.transport(
+                            "音频处理积压，听写已停止。请稍后重试。"
+                        ))
+                    }
+                }
             }
         }
         engine.prepare()

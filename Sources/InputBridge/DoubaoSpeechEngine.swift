@@ -68,6 +68,8 @@ final class DoubaoSpeechEngine: SpeechEngine {
         do {
             try await socket.send(.data(DoubaoASRProtocol.configuration()))
             let first = try await socket.receive()
+            try Task.checkCancellation()
+            guard self.socket === socket else { throw CancellationError() }
             connectionTimeout.cancel()
             let response = try Self.decode(first)
             if let error = response.error { throw BridgeError.transport(error) }
@@ -75,17 +77,19 @@ final class DoubaoSpeechEngine: SpeechEngine {
             lastText = response.text.map(TechnicalVocabulary.correcting) ?? ""
             if !lastText.isEmpty { onPartial?(lastText) }
             let (stream, continuation) = AsyncStream.makeStream(
-                of: Data.self, bufferingPolicy: .bufferingOldest(160)
+                of: Data.self, bufferingPolicy: .bufferingOldest(15)
             )
             audioStream = continuation
             sending = Task { [weak self] in
                 guard let self else { return }
                 do {
                     for await chunk in stream {
+                        try Task.checkCancellation()
+                        guard self.socket === socket else { return }
                         try await socket.send(.data(DoubaoASRProtocol.audio(chunk)))
                     }
                 } catch {
-                    if !self.stopping { self.onError?(error) }
+                    if self.socket === socket, !self.stopping { self.onError?(error) }
                 }
             }
             receiving = Task { [weak self] in
@@ -93,6 +97,7 @@ final class DoubaoSpeechEngine: SpeechEngine {
                 do {
                     while !Task.isCancelled, !self.gotFinal {
                         let response = try Self.decode(try await socket.receive())
+                        guard !Task.isCancelled, self.socket === socket else { return }
                         if let error = response.error {
                             throw BridgeError.transport(error)
                         }
@@ -106,13 +111,13 @@ final class DoubaoSpeechEngine: SpeechEngine {
                         if response.isLast { self.gotFinal = true }
                     }
                 } catch {
-                    if !self.stopping { self.onError?(error) }
+                    if self.socket === socket, !self.stopping { self.onError?(error) }
                 }
             }
             onStatus?("豆包语音 2.0 已就绪")
         } catch {
             connectionTimeout.cancel()
-            await cleanUp()
+            if self.socket === socket { await cleanUp() }
             throw error
         }
     }
@@ -132,6 +137,14 @@ final class DoubaoSpeechEngine: SpeechEngine {
     func stop() async {
         guard let socket else { return }
         stopping = true
+        // Cover draining queued sends as well as waiting for the final response.
+        let timeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(12))
+            guard !Task.isCancelled else { return }
+            self?.onStatus?("豆包收尾超时，已停止等待")
+            socket.cancel(with: .goingAway, reason: nil)
+        }
+        defer { timeout.cancel() }
         await capture.stop()
         if !accumulatedPCM.isEmpty {
             let tail = accumulatedPCM
@@ -142,12 +155,6 @@ final class DoubaoSpeechEngine: SpeechEngine {
         await sending?.value
         do { try await socket.send(.data(DoubaoASRProtocol.audio(Data(), last: true))) }
         catch { onStatus?("豆包音频结束包发送失败：\(error.localizedDescription)") }
-        let timeout = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(12))
-            guard !Task.isCancelled, let self, !self.gotFinal else { return }
-            self.onStatus?("豆包尾句等待超时")
-            socket.cancel(with: .goingAway, reason: nil)
-        }
         await receiving?.value
         timeout.cancel()
         if gotFinal { onFinal?(lastText) }
@@ -158,7 +165,7 @@ final class DoubaoSpeechEngine: SpeechEngine {
         stopping = true
         socket?.cancel(with: .goingAway, reason: nil)
         audioStream?.finish()
-        await capture.stop()
+        await capture.cancel()
         await cleanUp()
     }
 

@@ -68,6 +68,10 @@ final class BridgeModel: ObservableObject {
     private var incomingEndRequestedElapsedSeconds: TimeInterval?
     private var incomingFailed = false
     private var remoteCapability: ModelCapability?
+    private var linkWatchdog: Task<Void, Never>?
+    private var incomingLinkWatchdog: Task<Void, Never>?
+    private var lastRemoteProgressAt = ProcessInfo.processInfo.systemUptime
+    private var lastIncomingAudioAt = ProcessInfo.processInfo.systemUptime
     private let fallbackLoginAgentLabel = "com.inputbridge.macos.autostart"
 
     private enum OutputRoute {
@@ -100,9 +104,10 @@ final class BridgeModel: ObservableObject {
                     self.isFinishingDictation = true
                     self.updateHotkeyAvailability()
                     Task { @MainActor in
-                        await self.remoteAudioCapture.stop()
+                        await self.remoteAudioCapture.cancel()
                         self.clearOutgoingRemoteSession()
-                        self.fail(BridgeError.transport("远程连接已断开，听写已停止。"))
+                        self.fail(BridgeError.transport((status.hasPrefix("发送失败") || status.hasPrefix("连接失败"))
+                            ? status : "远程连接已断开，听写已停止。"))
                     }
                 }
             }
@@ -677,7 +682,7 @@ final class BridgeModel: ObservableObject {
                 guard !incomingFailed else { return }
                 incomingProgress.recognizedCharacters = text.count
                 pendingTranscript = text
-                publishIncomingProgress(force: true)
+                publishIncomingProgress()
                 startIncomingTranscriptWriter()
             } else if outgoingSession != nil, activeOutputRoute?.isLocal == true {
                 try injector.update(text)
@@ -808,10 +813,9 @@ final class BridgeModel: ObservableObject {
     }
 
     private func outgoingScreenSharingChanged(_ state: ScreenSharingState) {
-        let previous = outgoingScreenSharingState
+        guard outgoingScreenSharingState != state else { return }
         outgoingScreenSharingState = state
         updateHotkeyAvailability()
-        guard previous != state else { return }
         if let address = outgoingScreenSharingAddress {
             automaticRouteStatus = "检测到屏幕共享；切到共享窗口后自动远程输入"
             routeToScreenSharingTarget(address)
@@ -828,6 +832,7 @@ final class BridgeModel: ObservableObject {
     }
 
     private func incomingScreenSharingChanged(_ state: ScreenSharingState) {
+        guard incomingScreenSharingState != state else { return }
         incomingScreenSharingState = state
         updateHotkeyAvailability()
         if let activeConnectionID,
@@ -1011,6 +1016,7 @@ final class BridgeModel: ObservableObject {
                             return
                         }
                         self.incomingAudioReady = true
+                        self.watchIncomingLink(sessionID)
                         let queued = self.pendingIncomingAudio
                         self.pendingIncomingAudio.removeAll(keepingCapacity: true)
                         self.pendingIncomingAudioBytes = 0
@@ -1037,6 +1043,7 @@ final class BridgeModel: ObservableObject {
                       activeConnectionID == connectionID else { return }
                 guard !incomingFailed, let audio = message.audio, !audio.isEmpty,
                       audio.count.isMultiple(of: 4) else { return }
+                lastIncomingAudioAt = ProcessInfo.processInfo.systemUptime
                 incomingProgress.receive(audio)
                 publishIncomingProgress()
                 if incomingAudioReady {
@@ -1051,6 +1058,7 @@ final class BridgeModel: ObservableObject {
             case .audioEnd:
                 guard incomingSession == message.sessionId,
                       activeConnectionID == connectionID else { return }
+                incomingLinkWatchdog?.cancel()
                 incomingEndRequestedElapsedSeconds = message.endRequestedElapsedSeconds
                 receiverStatus = "已收到结束信号，正在完成远程识别…"
                 publishIncomingProgress(force: true)
@@ -1186,7 +1194,7 @@ final class BridgeModel: ObservableObject {
         }
         if !wasAlreadyStopping {
             if let incomingStartTask { await incomingStartTask.value }
-            if incomingAudioReady { await speech.stop() }
+            if incomingAudioReady { await speech.cancel() }
         }
         if !wasAlreadyStopping { clearIncomingAudioSession() }
         errorMessage = error.localizedDescription
@@ -1205,6 +1213,8 @@ final class BridgeModel: ObservableObject {
     }
 
     private func clearIncomingAudioSession() {
+        incomingLinkWatchdog?.cancel()
+        incomingLinkWatchdog = nil
         incomingFocusMonitor.stop()
         injector.end()
         incomingTranscriptTask?.cancel()
@@ -1259,6 +1269,8 @@ final class BridgeModel: ObservableObject {
     }
 
     private func clearOutgoingRemoteSession() {
+        linkWatchdog?.cancel()
+        linkWatchdog = nil
         outgoingFocusMonitor.stop()
         remoteReadyTimeout?.cancel()
         remoteFinishTimeout?.cancel()
@@ -1286,8 +1298,10 @@ final class BridgeModel: ObservableObject {
         }
         guard message.sessionId == outgoingSession,
               activeOutputRoute?.isLocal == false else { return }
+        lastRemoteProgressAt = ProcessInfo.processInfo.systemUptime
         switch message.type {
         case .audioReady:
+            watchOutgoingLink(message.sessionId)
             if let choice = message.modelDecision {
                 remoteModelStatus = choice.explanation
                 activeModelStatus = "B：\(choice.provider.title)"
@@ -1355,7 +1369,7 @@ final class BridgeModel: ObservableObject {
                     self.isRecording = false
                     self.isFinishingDictation = true
                     self.updateHotkeyAvailability()
-                    await self.remoteAudioCapture.stop()
+                    await self.remoteAudioCapture.cancel()
                     self.clearOutgoingRemoteSession()
                     self.fail(error)
                 }
@@ -1364,10 +1378,46 @@ final class BridgeModel: ObservableObject {
         }
     }
 
+    // PCM continues even during silence, and B acknowledges progress every 0.5 s.
+    // A half-open TCP connection must not leave either side recording indefinitely.
+    private func watchOutgoingLink(_ session: UUID) {
+        linkWatchdog?.cancel()
+        lastRemoteProgressAt = ProcessInfo.processInfo.systemUptime
+        linkWatchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self, self.outgoingSession == session else { return }
+                if self.isRecording,
+                   ProcessInfo.processInfo.systemUptime - self.lastRemoteProgressAt > 10 {
+                    self.client.disconnect(reason: "10 秒未收到 B 端进度，听写已停止。请检查 A 到 B 的连接。")
+                    return
+                }
+            }
+        }
+    }
+
+    private func watchIncomingLink(_ session: UUID) {
+        incomingLinkWatchdog?.cancel()
+        lastIncomingAudioAt = ProcessInfo.processInfo.systemUptime
+        incomingLinkWatchdog = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled, let self, self.incomingSession == session,
+                      !self.isStoppingIncoming else { return }
+                if ProcessInfo.processInfo.systemUptime - self.lastIncomingAudioAt > 10 {
+                    await self.failIncomingAudio(BridgeError.transport(
+                        "10 秒未收到 A 端音频，听写已停止。请检查两台 Mac 的网络。"
+                    ))
+                    return
+                }
+            }
+        }
+    }
+
     private func publishIncomingProgress(force: Bool = false) {
         guard let session = incomingSession, let connection = activeConnectionID else { return }
-        remoteProgressStatus = "\(receiverStatus) · \(incomingProgress.summary)"
         guard force || Date().timeIntervalSince(lastProgressSent) >= 0.5 else { return }
+        remoteProgressStatus = "\(receiverStatus) · \(incomingProgress.summary)"
         lastProgressSent = Date()
         try? server.send(TextMessage(sessionId: session, type: .audioStatus,
                                     token: settings.token, senderID: settings.deviceID,
@@ -1387,7 +1437,7 @@ final class BridgeModel: ObservableObject {
                     guard self.incomingSession == session, !Task.isCancelled else { return }
                     self.incomingProgress.writtenCharacters = text.count
                     self.incomingProgress.writeStatus = self.injector.verificationStatus
-                    self.publishIncomingProgress(force: true)
+                    self.publishIncomingProgress()
                 } catch {
                     guard self.incomingSession == session, !Task.isCancelled else { return }
                     await self.failIncomingAudio(error)

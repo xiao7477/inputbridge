@@ -13,9 +13,9 @@ final class VoiceOverlayController {
 
     func show(label: String = "正在听写", style: VoiceOverlayStyle = .local,
               animate: Bool = true) {
-        state.label = label
-        state.style = style
-        state.isAnimating = animate
+        if state.label != label { state.label = label }
+        if state.style != style { state.style = style }
+        if state.isAnimating != animate { state.isAnimating = animate }
         if panel == nil {
             let panel = NSPanel(
                 contentRect: NSRect(x: 0, y: 0, width: 184, height: 54),
@@ -69,22 +69,8 @@ private struct VoiceOverlayView: View {
             Image(systemName: "mic.fill")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(state.style == .remote ? Color.yellow : Color.white)
-            if state.isAnimating {
-                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-                    let time = timeline.date.timeIntervalSinceReferenceDate
-                    HStack(alignment: .center, spacing: 2.5) {
-                        ForEach(0..<7) { index in
-                            Capsule()
-                                .fill(Color.white.opacity(0.95))
-                                .frame(width: 1.5,
-                                       height: 6 + 18 * abs(sin(time * 5 + Double(index) * 0.72)))
-                        }
-                    }
-                    .frame(height: 28)
-                }
-            } else {
-                Color.clear.frame(width: 25, height: 28)
-            }
+            WaveformBars(animating: state.isAnimating)
+                .frame(width: 25, height: 28)
             Text(state.label)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.white)
@@ -95,5 +81,60 @@ private struct VoiceOverlayView: View {
         .background(Color.black, in: Capsule())
         .overlay(Capsule().strokeBorder(.white.opacity(0.18), lineWidth: 1))
         .frame(width: 184, height: 54)
+    }
+}
+
+/// Core Animation changes only layer transforms; no SwiftUI layout on each frame.
+private struct WaveformBars: NSViewRepresentable {
+    var animating: Bool
+
+    func makeNSView(context: Context) -> WaveformBarView { WaveformBarView() }
+    func updateNSView(_ view: WaveformBarView, context: Context) {
+        view.setAnimating(animating)
+    }
+    static func dismantleNSView(_ view: WaveformBarView, coordinator: ()) {
+        view.setAnimating(false)
+    }
+}
+
+private final class WaveformBarView: NSView {
+    private var bars: [CALayer] = []
+    private var animating = false
+
+    init() {
+        super.init(frame: NSRect(x: 0, y: 0, width: 25, height: 28))
+        wantsLayer = true
+        for index in 0..<7 {
+            let bar = CALayer()
+            bar.bounds = CGRect(x: 0, y: 0, width: 1.5, height: 24)
+            bar.position = CGPoint(x: 0.75 + Double(index) * 4, y: 14)
+            bar.cornerRadius = 0.75
+            bar.backgroundColor = NSColor.white.withAlphaComponent(0.95).cgColor
+            bar.isHidden = true
+            layer?.addSublayer(bar)
+            bars.append(bar)
+        }
+    }
+    required init?(coder: NSCoder) { nil }
+
+    func setAnimating(_ active: Bool) {
+        guard active != animating else { return }
+        animating = active
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, bar) in bars.enumerated() {
+            bar.isHidden = !active
+            bar.removeAllAnimations()
+            if active {
+                let animation = CAKeyframeAnimation(keyPath: "transform.scale.y")
+                animation.values = [0.25, 1, 0.4, 0.8, 0.25]
+                animation.duration = 1.1
+                animation.timeOffset = Double(index) * 0.13
+                animation.repeatCount = .infinity
+                animation.calculationMode = .linear
+                bar.add(animation, forKey: "waveform")
+            }
+        }
+        CATransaction.commit()
     }
 }

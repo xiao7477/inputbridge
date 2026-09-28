@@ -116,6 +116,32 @@ struct TransportSmoke {
         clientB.disconnect()
         server.stop()
 
+        // Reconnect after teardown and deliver a burst of 100 ms audio packets,
+        // a partial final packet and the stop message without reordering or loss.
+        // NWListener.cancel() releases its socket asynchronously on its queue.
+        try await Task.sleep(for: .milliseconds(300))
+        try server.start(port: 54839, token: token)
+        try await Task.sleep(for: .milliseconds(200))
+        try await clientA.connect(host: "127.0.0.1", port: 54839, token: "",
+                                  deviceID: controllerA, deviceName: "Mac A")
+        let burstSession = UUID()
+        let chunks = (0..<12).map { Data(repeating: UInt8($0), count: $0 == 11 ? 684 : 6_400) }
+        for chunk in chunks {
+            try clientA.send(TextMessage(sessionId: burstSession, type: .audioChunk, audio: chunk,
+                                        token: token, senderID: controllerA, senderName: "Mac A"))
+        }
+        try clientA.send(TextMessage(sessionId: burstSession, type: .audioEnd, token: token,
+                                    senderID: controllerA, senderName: "Mac A"))
+        for chunk in chunks {
+            let received = await iterator.next()
+            precondition(received?.0.sessionId == burstSession)
+            precondition(received?.0.audio == chunk)
+        }
+        let end = await iterator.next()
+        precondition(end?.0.type == .audioEnd)
+        clientA.disconnect()
+        server.stop()
+
         server.pairingAuthorization = { _, _, _ in "不是当前屏幕共享操作端" }
         try server.start(port: 54840, token: token)
         try await Task.sleep(nanoseconds: 200_000_000)
