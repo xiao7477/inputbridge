@@ -73,7 +73,7 @@ private struct VoiceOverlayView: View {
                 .frame(width: 25, height: 28)
             Text(state.label)
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(state.label == "正在听写" ? Color.green : Color.white)
                 .lineLimit(1)
         }
         .padding(.horizontal, 16)
