@@ -259,6 +259,7 @@ final class GlobalHotkeyManager {
         if flags.contains(.maskAlternate) { result.insert(.option) }
         if flags.contains(.maskControl) { result.insert(.control) }
         if flags.contains(.maskShift) { result.insert(.shift) }
+        if flags.contains(.maskSecondaryFn) { result.insert(.function) }
         return result
     }
 
@@ -332,12 +333,20 @@ final class GlobalHotkeyManager {
 
     private func isShortcutPhysicallyDown() -> Bool {
         let flags = CGEventSource.flagsState(.combinedSessionState)
-        let allGroups: CGEventFlags = [.maskCommand, .maskAlternate, .maskControl, .maskShift]
+        let allGroups: CGEventFlags = [
+            .maskCommand, .maskAlternate, .maskControl, .maskShift, .maskSecondaryFn
+        ]
         var required: CGEventFlags = []
         for code in shortcut.modifierKeyCodes {
             if let flag = GlobalShortcut.cgModifierFlag(for: code) { required.insert(flag) }
         }
         guard flags.intersection(allGroups) == required else { return false }
+        let expectedModifiers = Set(shortcut.modifierKeyCodes)
+        let physicalModifiersMatch = GlobalShortcut.modifierOrder.allSatisfy { code in
+            let isDown = CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code))
+            return isDown == expectedModifiers.contains(code)
+        }
+        guard physicalModifiersMatch else { return false }
         if let keyCode = shortcut.keyCode {
             return CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(keyCode))
         }

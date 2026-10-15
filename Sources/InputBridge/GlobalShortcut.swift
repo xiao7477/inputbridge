@@ -30,7 +30,8 @@ struct GlobalShortcut: Codable, Equatable {
         UInt16(kVK_Control), UInt16(kVK_RightControl),
         UInt16(kVK_Option), UInt16(kVK_RightOption),
         UInt16(kVK_Shift), UInt16(kVK_RightShift),
-        UInt16(kVK_Command), UInt16(kVK_RightCommand)
+        UInt16(kVK_Command), UInt16(kVK_RightCommand),
+        UInt16(kVK_Function)
     ]
 
     init(modifierKeyCodes: [UInt16], keyCode: UInt16? = nil, keyLabel: String = "") {
@@ -98,6 +99,7 @@ struct GlobalShortcut: Codable, Equatable {
         case kVK_Option, kVK_RightOption: .option
         case kVK_Control, kVK_RightControl: .control
         case kVK_Shift, kVK_RightShift: .shift
+        case kVK_Function: .function
         default: nil
         }
     }
@@ -108,6 +110,7 @@ struct GlobalShortcut: Codable, Equatable {
         case kVK_Option, kVK_RightOption: .maskAlternate
         case kVK_Control, kVK_RightControl: .maskControl
         case kVK_Shift, kVK_RightShift: .maskShift
+        case kVK_Function: .maskSecondaryFn
         default: nil
         }
     }
@@ -122,6 +125,7 @@ struct GlobalShortcut: Codable, Equatable {
         case kVK_RightControl: "右⌃"
         case kVK_Shift: "左⇧"
         case kVK_RightShift: "右⇧"
+        case kVK_Function: "Fn"
         default: "?"
         }
     }
