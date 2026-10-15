@@ -5,11 +5,21 @@ ROOT="${0:A:h:h}"
 cd "$ROOT"
 
 LOCAL_ONLY=0
-if [[ "${1:-}" == "--local-only" ]]; then
-  LOCAL_ONLY=1
-elif (( $# > 0 )); then
-  print -u2 "用法：zsh Scripts/package.sh [--local-only]"
+DEBUG_BUILD=0
+for argument in "$@"; do
+  case "$argument" in
+    --local-only) LOCAL_ONLY=1 ;;
+    --debug) DEBUG_BUILD=1 ;;
+    *) print -u2 "用法：zsh Scripts/package.sh [--local-only] [--debug]"; exit 2 ;;
+  esac
+done
+if (( DEBUG_BUILD && !LOCAL_ONLY )); then
+  print -u2 "调试构建请同时使用 --local-only。"
   exit 2
+fi
+SWIFT_OPTIONS=(-O)
+if (( DEBUG_BUILD )); then
+  SWIFT_OPTIONS=(-Onone -D DEBUG)
 fi
 
 SDK="${SDKROOT:-}"
@@ -29,7 +39,7 @@ cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/Resources/AppIcon-liquid-micwave-v2.icns" "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/Scripts/install-update.sh" "$APP/Contents/Resources/install-update.sh"
 
-swiftc -O -parse-as-library \
+swiftc "${SWIFT_OPTIONS[@]}" -parse-as-library \
   -module-name InputBridge \
   -sdk "$SDK" \
   -target arm64-apple-macosx14.0 \

@@ -7,11 +7,12 @@ protocol SpeechEngine: AnyObject {
     var onFinal: ((String) -> Void)? { get set }
     var onError: ((Error) -> Void)? { get set }
     var onStatus: ((String) -> Void)? { get set }
+    var latency: SpeechLatency? { get set }
+    var isPrepared: Bool { get }
     func preparePermissions(locale: Locale) async throws
-    func start(locale: Locale, microphoneUID: String) async throws
     func startNetwork(locale: Locale) async throws
     func appendNetworkAudio(_ data: Data)
-    func stop() async
+    func stop(keepingResources: Bool) async
     func cancel() async
 }
 
@@ -21,8 +22,12 @@ final class AppleSpeechEngine: SpeechEngine {
     var onFinal: ((String) -> Void)?
     var onError: ((Error) -> Void)?
     var onStatus: ((String) -> Void)?
+    var latency: SpeechLatency?
+    var isPrepared: Bool { recognizer != nil }
 
-    private var audioEngine: AVAudioEngine?
+    private var recognizer: SFSpeechRecognizer?
+    private var preparedLocale: String?
+    private var sessionID = UUID()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var finishContinuation: CheckedContinuation<Void, Never>?
@@ -31,30 +36,6 @@ final class AppleSpeechEngine: SpeechEngine {
 
     func preparePermissions(locale: Locale) async throws {
         try await prepare(locale: locale, needsMicrophone: true)
-    }
-
-    func start(locale: Locale, microphoneUID: String) async throws {
-        await cleanUp()
-        try await prepare(locale: locale, needsMicrophone: true)
-        try configureRecognition(locale: locale)
-
-        let engine = AVAudioEngine()
-        try AudioInputDeviceManager.configure(engine, deviceUID: microphoneUID)
-        let input = engine.inputNode
-        let format = input.outputFormat(forBus: 0)
-        guard let request else { throw BridgeError.transport("语音识别尚未准备好。") }
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-            request.append(buffer)
-        }
-        engine.prepare()
-        do {
-            try engine.start()
-            audioEngine = engine
-        } catch {
-            input.removeTap(onBus: 0)
-            await cleanUp()
-            throw error
-        }
     }
 
     func startNetwork(locale: Locale) async throws {
@@ -68,38 +49,43 @@ final class AppleSpeechEngine: SpeechEngine {
         request?.append(buffer)
     }
 
-    func stop() async {
-        guard request != nil || audioEngine != nil else { return }
+    func stop(keepingResources: Bool) async {
+        guard request != nil else { return }
         stopping = true
-        if let audioEngine {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
         request?.endAudio()
         if !didFinish {
+            let sessionID = sessionID
             await withCheckedContinuation { continuation in
                 finishContinuation = continuation
                 Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    guard self?.sessionID == sessionID else { return }
                     self?.finish()
                 }
             }
         }
         await cleanUp()
+        if !keepingResources {
+            recognizer = nil
+            preparedLocale = nil
+        }
     }
 
     func cancel() async {
         stopping = true
         await cleanUp()
+        recognizer = nil
+        preparedLocale = nil
     }
 
     private func prepare(locale: Locale, needsMicrophone: Bool) async throws {
-        let authorized = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status == .authorized)
+        var authorization = SFSpeechRecognizer.authorizationStatus()
+        if authorization == .notDetermined {
+            authorization = await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) }
             }
         }
-        guard authorized else {
+        guard authorization == .authorized else {
             throw BridgeError.permission("请允许“语音输入共享”使用语音识别。")
         }
         if needsMicrophone {
@@ -112,16 +98,17 @@ final class AppleSpeechEngine: SpeechEngine {
                 throw BridgeError.permission("请允许“语音输入共享”使用麦克风。")
             }
         }
-        guard let recognizer = SFSpeechRecognizer(locale: locale),
-              recognizer.supportsOnDeviceRecognition else {
-            throw BridgeError.unsupportedLocale
+        if preparedLocale != locale.identifier || recognizer == nil {
+            guard let next = SFSpeechRecognizer(locale: locale),
+                  next.supportsOnDeviceRecognition else { throw BridgeError.unsupportedLocale }
+            recognizer = next
+            preparedLocale = locale.identifier
         }
         onStatus?("Apple 设备端听写模型已就绪")
     }
 
     private func configureRecognition(locale: Locale) throws {
-        guard let recognizer = SFSpeechRecognizer(locale: locale),
-              recognizer.supportsOnDeviceRecognition else {
+        guard let recognizer else {
             throw BridgeError.unsupportedLocale
         }
         guard recognizer.isAvailable else {
@@ -136,9 +123,15 @@ final class AppleSpeechEngine: SpeechEngine {
         request = speechRequest
         didFinish = false
         stopping = false
+        sessionID = UUID()
+        let sessionID = sessionID
         task = recognizer.recognitionTask(with: speechRequest) { [weak self] result, error in
-            Task { @MainActor in self?.handle(result: result, error: error) }
+            Task { @MainActor in
+                guard self?.sessionID == sessionID else { return }
+                self?.handle(result: result, error: error)
+            }
         }
+        latency?.mark("Analyzer ready")
     }
 
     private func handle(result: SFSpeechRecognitionResult?, error: Error?) {
@@ -165,14 +158,10 @@ final class AppleSpeechEngine: SpeechEngine {
     }
 
     private func cleanUp() async {
-        if let audioEngine, audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
+        sessionID = UUID()
         task?.cancel()
         task = nil
         request = nil
-        audioEngine = nil
         finish()
     }
 }

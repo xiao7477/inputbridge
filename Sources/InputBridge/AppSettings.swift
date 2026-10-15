@@ -49,6 +49,7 @@ final class AppSettings: ObservableObject {
     }
     @Published var doubaoCredentialStatus: String
     @Published var microphoneUID: String { didSet { save() } }
+    @Published var speechIdleTimeout: SpeechIdleTimeout { didSet { save() } }
     @Published var shortcut: GlobalShortcut { didSet { save() } }
     @Published var shortcutMode: ShortcutActivationMode { didSet { save() } }
     @Published var deviceName: String { didSet { save() } }
@@ -85,6 +86,8 @@ final class AppSettings: ObservableObject {
         doubaoAPIKey = storedDoubaoKey
         doubaoCredentialStatus = storedDoubaoKey.isEmpty ? "未配置" : "已保存在本机钥匙串"
         microphoneUID = defaults.string(forKey: "microphoneUID") ?? ""
+        speechIdleTimeout = (defaults.object(forKey: "speechIdleTimeout") as? Int)
+            .flatMap(SpeechIdleTimeout.init(rawValue:)) ?? .fiveMinutes
         if let data = defaults.data(forKey: "shortcutV2"),
            let decoded = try? JSONDecoder().decode(GlobalShortcut.self, from: data) {
             if !defaults.bool(forKey: "repairedDuplicatedModifierSidesV043") {
@@ -177,6 +180,7 @@ final class AppSettings: ObservableObject {
         defaults.set(modelSelectionMode.rawValue, forKey: "modelSelectionMode")
         defaults.set(doubaoResourceID, forKey: "doubaoResourceID")
         defaults.set(microphoneUID, forKey: "microphoneUID")
+        defaults.set(speechIdleTimeout.rawValue, forKey: "speechIdleTimeout")
         defaults.set(try? JSONEncoder().encode(shortcut), forKey: "shortcutV2")
         defaults.set(shortcutMode.rawValue, forKey: "shortcutMode")
         defaults.set(deviceName, forKey: "deviceName")

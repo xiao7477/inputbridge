@@ -6,10 +6,11 @@ final class DoubaoSpeechEngine: SpeechEngine {
     var onFinal: ((String) -> Void)?
     var onError: ((Error) -> Void)?
     var onStatus: ((String) -> Void)?
+    var latency: SpeechLatency?
+    var isPrepared: Bool { false } // A completed WebSocket session cannot be reused.
 
     private let apiKey: String
     private let resourceID: String
-    private let capture = RemoteAudioCapture()
     private var session: URLSession?
     private var socket: URLSessionWebSocketTask?
     private var audioStream: AsyncStream<Data>.Continuation?
@@ -23,22 +24,11 @@ final class DoubaoSpeechEngine: SpeechEngine {
     init(apiKey: String, resourceID: String) {
         self.apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         self.resourceID = resourceID
-        capture.onPacket = { [weak self] bytes in self?.appendNetworkAudio(bytes) }
-        capture.onError = { [weak self] error in self?.onError?(error) }
     }
 
     func preparePermissions(locale: Locale) async throws {
         guard !apiKey.isEmpty else {
             throw BridgeError.transport("尚未设置豆包语音 API Key。")
-        }
-    }
-
-    func start(locale: Locale, microphoneUID: String) async throws {
-        try await startNetwork(locale: locale)
-        do { try await capture.start(microphoneUID: microphoneUID) }
-        catch {
-            await stop()
-            throw error
         }
     }
 
@@ -134,7 +124,7 @@ final class DoubaoSpeechEngine: SpeechEngine {
         }
     }
 
-    func stop() async {
+    func stop(keepingResources: Bool) async {
         guard let socket else { return }
         stopping = true
         // Cover draining queued sends as well as waiting for the final response.
@@ -145,7 +135,6 @@ final class DoubaoSpeechEngine: SpeechEngine {
             socket.cancel(with: .goingAway, reason: nil)
         }
         defer { timeout.cancel() }
-        await capture.stop()
         if !accumulatedPCM.isEmpty {
             let tail = accumulatedPCM
             accumulatedPCM.removeAll()
@@ -165,7 +154,6 @@ final class DoubaoSpeechEngine: SpeechEngine {
         stopping = true
         socket?.cancel(with: .goingAway, reason: nil)
         audioStream?.finish()
-        await capture.cancel()
         await cleanUp()
     }
 

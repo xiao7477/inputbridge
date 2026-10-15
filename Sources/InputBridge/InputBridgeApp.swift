@@ -237,6 +237,15 @@ private struct SettingsView: View {
                     Text("English (US)").tag("en-US")
                 }
 
+                Picker("语音引擎空闲释放时间", selection: $settings.speechIdleTimeout) {
+                    ForEach(SpeechIdleTimeout.allCases) { timeout in
+                        Text(timeout.title).tag(timeout)
+                    }
+                }
+                Text("连续听写期间保留识别资源以加快启动；待机时麦克风始终关闭。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 HStack {
                     Picker("麦克风", selection: $settings.microphoneUID) {
                         Text("跟随系统").tag("")

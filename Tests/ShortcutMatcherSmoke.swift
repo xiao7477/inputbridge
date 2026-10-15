@@ -109,6 +109,31 @@ struct ShortcutMatcherSmoke {
         precondition(capture.modifierChanged(code: leftCommand, groupIsDown: false) == nil)
         let modifierChord = capture.modifierChanged(code: rightOption, groupIsDown: false)
         precondition(modifierChord?.modifierKeyCodes == [rightOption, leftCommand])
+        for modifier in [kVK_Function, kVK_Option, kVK_Control, kVK_Shift] {
+            let code = UInt16(modifier)
+            let shortcut = GlobalShortcut(modifierKeyCodes: [code])
+            matcher.reset()
+            precondition(matcher.keyChanged(code: UInt16(kVK_ANSI_A), isDown: true,
+                                             isRepeat: false, shortcut: shortcut, mode: .hold).isEmpty)
+            precondition(matcher.modifierChanged(code: code, groupIsDown: true,
+                                                 shortcut: shortcut, mode: .hold) == [.armModifierHold],
+                         "Plain typing must not suppress the next modifier gesture")
+            _ = matcher.keyChanged(code: UInt16(kVK_ANSI_A), isDown: true,
+                                    isRepeat: false, shortcut: shortcut, mode: .hold)
+            precondition(matcher.activateModifierHold(shortcut: shortcut).isEmpty)
+            _ = matcher.keyChanged(code: UInt16(kVK_ANSI_A), isDown: false,
+                                    isRepeat: false, shortcut: shortcut, mode: .hold)
+            precondition(matcher.activateModifierHold(shortcut: shortcut).isEmpty,
+                         "Releasing a chord's character must not rearm a still-held modifier")
+            _ = matcher.modifierChanged(code: code, groupIsDown: false,
+                                         shortcut: shortcut, mode: .hold)
+            precondition(matcher.modifierChanged(code: code, groupIsDown: true,
+                                                 shortcut: shortcut, mode: .hold) == [.armModifierHold])
+            _ = matcher.modifierChanged(code: code, groupIsDown: false,
+                                         shortcut: shortcut, mode: .hold)
+            precondition(matcher.activateModifierHold(shortcut: shortcut).isEmpty,
+                         "A short tap released before confirmation must stay cancelled")
+        }
         print("PASS: 左右修饰键、单键/组合键、按住/切换及旧设置迁移")
     }
 }

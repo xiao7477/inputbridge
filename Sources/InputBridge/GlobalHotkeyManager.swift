@@ -4,6 +4,8 @@ import Foundation
 
 @MainActor
 final class GlobalHotkeyManager {
+    var onPrepare: ((TimeInterval?) -> Void)?
+    var onDiscardPreparation: (() -> Void)?
     var onPress: (() -> Void)?
     var onRelease: ((TimeInterval?) -> Void)?
     var onToggle: ((TimeInterval?) -> Void)?
@@ -30,6 +32,8 @@ final class GlobalHotkeyManager {
     private var compatibilityTriggered = false
     private var compatibilityNativeHandled = false
     private var compatibilityDownSince: Date?
+    private var compatibilityPreparing = false
+    private var compatibilityBlockedUntilRelease = false
     private var escapeWasDown = false
     private var consumingEscape = false
     private var enabled = true
@@ -174,6 +178,12 @@ final class GlobalHotkeyManager {
         }
 
         let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        if type == .keyDown, shortcut.keyCode == nil {
+            compatibilityBlockedUntilRelease = true
+            act(on: matcher.keyChanged(code: code, isDown: true,
+                                       isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
+                                       shortcut: shortcut, mode: mode), event: event)
+        }
         if (type == .keyDown || type == .keyUp), code == UInt16(kVK_Escape) {
             return handleEscape(type: type, event: event)
         }
@@ -204,11 +214,6 @@ final class GlobalHotkeyManager {
         guard type == .keyDown || type == .keyUp else { return Unmanaged.passUnretained(event) }
 
         if shortcut.keyCode == nil {
-            if type == .keyDown {
-                act(on: matcher.keyChanged(code: code, isDown: true,
-                                           isRepeat: event.getIntegerValueField(.keyboardEventAutorepeat) != 0,
-                                           shortcut: shortcut, mode: mode), event: event)
-            }
             return Unmanaged.passUnretained(event)
         }
         guard code == shortcut.keyCode else { return Unmanaged.passUnretained(event) }
@@ -264,11 +269,12 @@ final class GlobalHotkeyManager {
     }
 
     private func resetTrigger() {
-        if matcher.holdActive { onRelease?(nil) }
+        if matcher.holdActive || (compatibilityTriggered && mode == .hold) { onRelease?(nil) }
         matcher.reset()
         consumingKey = false
         pendingHold?.cancel()
         pendingHold = nil
+        onDiscardPreparation?()
     }
 
     private func startCompatibilityTimer() {
@@ -284,22 +290,39 @@ final class GlobalHotkeyManager {
     private func checkCompatibilityShortcut() {
         guard enabled else { return }
         checkCompatibilityEscape()
-        guard !capturing else { return }
+        guard !capturing, !suppressUntilModifiersReleased else { return }
+        let anyShortcutModifierDown = shortcut.modifierKeyCodes.contains {
+            CGEventSource.keyState(.combinedSessionState, key: CGKeyCode($0))
+        }
+        if compatibilityBlockedUntilRelease {
+            if compatibilityTriggered, mode == .hold { onRelease?(nil) }
+            resetCompatibilityState()
+            if !anyShortcutModifierDown { compatibilityBlockedUntilRelease = false }
+            else { return }
+        }
         let isDown = isShortcutPhysicallyDown()
         if !isDown {
             if compatibilityTriggered, mode == .hold { onRelease?(nil) }
+            if shortcut.keyCode == nil, compatibilityWasDown, anyShortcutModifierDown {
+                compatibilityBlockedUntilRelease = true
+            }
             resetCompatibilityState()
             return
         }
         if !compatibilityWasDown {
             compatibilityWasDown = true
             compatibilityDownSince = Date()
+            if !compatibilityNativeHandled, mode == .hold, shortcut.keyCode == nil {
+                compatibilityPreparing = true
+                onPrepare?(nil)
+            }
         }
         guard !compatibilityTriggered, !compatibilityNativeHandled,
               let compatibilityDownSince else { return }
-        let delay = shortcut.keyCode == nil ? 0.22 : 0.045
+        let delay = shortcut.keyCode == nil ? 0.1 : 0.045
         guard Date().timeIntervalSince(compatibilityDownSince) >= delay else { return }
         compatibilityTriggered = true
+        onPrepare?(nil)
         if mode == .hold { onPress?() }
         else { onToggle?(nil) }
     }
@@ -370,6 +393,8 @@ final class GlobalHotkeyManager {
     }
 
     private func resetCompatibilityState() {
+        if compatibilityPreparing { onDiscardPreparation?() }
+        compatibilityPreparing = false
         compatibilityWasDown = false
         compatibilityTriggered = false
         compatibilityNativeHandled = false
@@ -379,16 +404,22 @@ final class GlobalHotkeyManager {
     private func act(on signals: [HotkeySignal], event: CGEvent? = nil) {
         for signal in signals {
             switch signal {
-            case .press: onPress?()
+            case .press:
+                onPrepare?(eventTimestamp(event))
+                onPress?()
             case .release: onRelease?(eventTimestamp(event))
-            case .toggle: onToggle?(eventTimestamp(event))
+            case .toggle:
+                onPrepare?(eventTimestamp(event))
+                onToggle?(eventTimestamp(event))
             case .cancelModifierHold:
                 pendingHold?.cancel()
                 pendingHold = nil
+                onDiscardPreparation?()
             case .armModifierHold:
                 pendingHold?.cancel()
+                onPrepare?(eventTimestamp(event))
                 pendingHold = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: 220_000_000)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
                     guard !Task.isCancelled, let self else { return }
                     self.act(on: self.matcher.activateModifierHold(shortcut: self.shortcut))
                     self.pendingHold = nil

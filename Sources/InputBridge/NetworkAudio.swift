@@ -39,9 +39,13 @@ enum NetworkAudioPCM {
 }
 
 @MainActor
-final class RemoteAudioCapture {
+final class RemoteAudioCapture: DictationAudioCapture {
     var onPacket: ((Data) -> Void)?
     var onError: ((Error) -> Void)?
+    var latency: SpeechLatency?
+    var canStartSpeculatively: Bool {
+        AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    }
 
     private struct SendableBuffer: @unchecked Sendable {
         let buffer: AVAudioPCMBuffer
@@ -59,10 +63,15 @@ final class RemoteAudioCapture {
     private var inputContinuation: AsyncStream<SendableBuffer>.Continuation?
     private var conversionTask: Task<Void, Never>?
     private var finishingTask: Task<Void, Never>?
+    private var startGeneration = 0
 
     func start(microphoneUID: String) async throws {
         await stop()
+        try Task.checkCancellation()
+        let generation = startGeneration
         let allowed = await requestMicrophonePermission()
+        try Task.checkCancellation()
+        guard generation == startGeneration else { throw CancellationError() }
         guard allowed else {
             throw BridgeError.permission("请允许“语音输入共享”使用麦克风。")
         }
@@ -136,8 +145,10 @@ final class RemoteAudioCapture {
             }
         }
 
+        let latency = latency
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: sourceFormat) {
             buffer, _ in
+            latency?.mark("First audio buffer")
             if let copy = Self.copyBuffer(buffer) {
                 if case .dropped = continuation.yield(SendableBuffer(buffer: copy)) {
                     continuation.finish()
@@ -153,6 +164,7 @@ final class RemoteAudioCapture {
         do {
             try engine.start()
             audioEngine = engine
+            latency?.mark("AudioEngine started")
         } catch {
             inputNode.removeTap(onBus: 0)
             continuation.finish()
@@ -171,18 +183,24 @@ final class RemoteAudioCapture {
         await finish(cancelPending: true)
     }
 
+    func stopMicrophone() {
+        startGeneration += 1
+        if let audioEngine {
+            audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+        }
+        audioEngine = nil
+        inputContinuation?.finish()
+    }
+
     private func finish(cancelPending: Bool) async {
+        stopMicrophone()
         if let finishingTask {
             if cancelPending { conversionTask?.cancel() }
             await finishingTask.value
             return
         }
         let task = Task { @MainActor in
-            if let audioEngine {
-                audioEngine.stop()
-                audioEngine.inputNode.removeTap(onBus: 0)
-            }
-            inputContinuation?.finish()
             if cancelPending { conversionTask?.cancel() }
             await conversionTask?.value
             audioEngine = nil

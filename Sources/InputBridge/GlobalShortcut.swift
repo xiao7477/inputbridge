@@ -266,7 +266,9 @@ struct ShortcutMatcher {
                              shortcut: GlobalShortcut,
                              mode: ShortcutActivationMode) -> [HotkeySignal] {
         if shortcut.keyCode == nil {
-            guard isDown else { return [] }
+            // Plain typing without a modifier must not poison the next solo
+            // gesture. Only an actual chord disarms modifier-only dictation.
+            guard isDown, !pressedModifiers.isEmpty else { return [] }
             soloArmed = false
             soloUsed = true
             var signals: [HotkeySignal] = [.cancelModifierHold]

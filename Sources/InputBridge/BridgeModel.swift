@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import ServiceManagement
 
@@ -36,8 +37,11 @@ final class BridgeModel: ObservableObject {
     private let outgoingFocusMonitor = InputFocusMonitor()
     private let incomingFocusMonitor = InputFocusMonitor()
     private let overlay = VoiceOverlayController()
-    private var speech: SpeechEngine = makeAppleSpeechEngine()
-    private let remoteAudioCapture = RemoteAudioCapture()
+    private var speech = RetainedSpeechEngine(engine: makeAppleSpeechEngine())
+    private var speechConfiguration: SpeechConfiguration?
+    private var outgoingAudio: DictationAudioSession?
+    private var observers = Set<AnyCancellable>()
+    private var memoryPressure: DispatchSourceMemoryPressure?
     private let hotkey = GlobalHotkeyManager()
     private var outgoingSession: UUID?
     private var incomingSession: UUID?
@@ -74,6 +78,14 @@ final class BridgeModel: ObservableObject {
     private var lastIncomingAudioAt = ProcessInfo.processInfo.systemUptime
     private let fallbackLoginAgentLabel = "com.inputbridge.macos.autostart"
 
+    private struct SpeechConfiguration: Equatable {
+        let provider: RecognitionProvider
+        let locale: String
+        let microphoneUID: String
+        let apiKey: String
+        let resourceID: String
+    }
+
     private enum OutputRoute {
         case local
         case remote(RemoteTarget)
@@ -104,7 +116,8 @@ final class BridgeModel: ObservableObject {
                     self.isFinishingDictation = true
                     self.updateHotkeyAvailability()
                     Task { @MainActor in
-                        await self.remoteAudioCapture.cancel()
+                        self.outgoingAudio?.cancel()
+                        self.outgoingAudio = nil
                         self.clearOutgoingRemoteSession()
                         self.fail(BridgeError.transport((status.hasPrefix("发送失败") || status.hasPrefix("连接失败"))
                             ? status : "远程连接已断开，听写已停止。"))
@@ -150,7 +163,16 @@ final class BridgeModel: ObservableObject {
                 self?.publishIncomingProgress(force: true)
             }
         }
+        hotkey.onPrepare = { [weak self] timestamp in
+            self?.prepareOutgoingAudio(receivedAt: timestamp)
+        }
+        hotkey.onDiscardPreparation = { [weak self] in
+            guard let self, self.outgoingAudio?.isConfirmed == false else { return }
+            self.outgoingAudio?.cancel()
+            self.outgoingAudio = nil
+        }
         hotkey.onPress = { [weak self] in
+            self?.outgoingAudio?.confirm()
             Task { @MainActor in await self?.beginDictation() }
         }
         hotkey.onRelease = { [weak self] eventTimestamp in
@@ -159,16 +181,26 @@ final class BridgeModel: ObservableObject {
         }
         hotkey.onToggle = { [weak self] eventTimestamp in
             let requestedAt = eventTimestamp ?? ProcessInfo.processInfo.systemUptime
+            if let self, !self.isRecording, !self.isStarting { self.outgoingAudio?.confirm() }
             Task { @MainActor in
                 guard let self else { return }
                 if self.isRecording || self.isStarting {
                     await self.endDictation(requestedAt: requestedAt)
                 }
-                else { await self.beginDictation() }
+                else {
+                    self.outgoingAudio?.confirm()
+                    await self.beginDictation()
+                }
             }
         }
         hotkey.onCancel = { [weak self] in
-            guard let self, self.isRecording || self.isStarting else { return false }
+            guard let self else { return false }
+            if self.outgoingAudio?.isConfirmed == false {
+                self.outgoingAudio?.cancel()
+                self.outgoingAudio = nil
+                return false
+            }
+            guard self.isRecording || self.isStarting else { return false }
             Task { @MainActor in await self.endDictation() }
             return true
         }
@@ -176,27 +208,14 @@ final class BridgeModel: ObservableObject {
             self?.finishShortcutCapture(shortcut)
         }
         hotkey.onMonitorFailure = { [weak self] message in
+            self?.hotkey.setEnabled(false)
             self?.errorMessage = message
             self?.speechStatus = "快捷键监听已暂停"
-        }
-        remoteAudioCapture.onPacket = { [weak self] data in
-            guard let self,
-                  let session = self.outgoingSession,
-                  self.activeOutputRoute?.isLocal == false else { return }
-            do {
-                try self.client.send(
-                    self.makeMessage(session: session, type: .audioChunk, audio: data)
-                )
-            } catch {
-                self.fail(error)
-                Task { @MainActor in await self.endDictation() }
+            if let self, self.isStarting || self.isRecording {
+                Task { await self.endDictation() }
             }
         }
-        remoteAudioCapture.onError = { [weak self] error in
-            guard let self else { return }
-            self.fail(error)
-            Task { @MainActor in await self.endDictation() }
-        }
+        observeSpeechResources()
         if settings.token.isEmpty { settings.makeToken() }
         refreshMicrophones()
         refreshLaunchAtLoginStatus()
@@ -281,16 +300,88 @@ final class BridgeModel: ObservableObject {
     }
 
     private func configureSpeech(_ provider: RecognitionProvider) {
-        let next: SpeechEngine = provider == .doubao
+        let configuration = SpeechConfiguration(
+            provider: provider, locale: settings.locale, microphoneUID: settings.microphoneUID,
+            apiKey: provider == .doubao ? settings.doubaoAPIKey : "",
+            resourceID: provider == .doubao ? settings.doubaoResourceID : ""
+        )
+        guard configuration != speechConfiguration else {
+            activeModelStatus = provider.title
+            return
+        }
+        let engine: SpeechEngine = provider == .doubao
             ? DoubaoSpeechEngine(apiKey: settings.doubaoAPIKey,
                                  resourceID: settings.doubaoResourceID)
             : makeAppleSpeechEngine()
+        let next = RetainedSpeechEngine(engine: engine)
+        next.idleTimeout = settings.speechIdleTimeout
         next.onPartial = speech.onPartial
         next.onFinal = speech.onFinal
         next.onError = speech.onError
         next.onStatus = speech.onStatus
+        let previous = speech
+        previous.onPartial = nil
+        previous.onFinal = nil
+        previous.onError = nil
+        previous.onStatus = nil
+        Task { await previous.cancel() }
         speech = next
+        speechConfiguration = configuration
         activeModelStatus = provider.title
+    }
+
+    private func observeSpeechResources() {
+        settings.$locale.combineLatest(settings.$microphoneUID, settings.$recognitionProvider)
+            .combineLatest(settings.$doubaoAPIKey, settings.$doubaoResourceID)
+            .dropFirst()
+            .sink { [weak self] _ in
+                self?.speechConfiguration = nil
+                self?.speech.invalidate()
+                if self?.outgoingAudio?.isConfirmed == false {
+                    self?.outgoingAudio?.cancel()
+                    self?.outgoingAudio = nil
+                }
+            }.store(in: &observers)
+        settings.$speechIdleTimeout.sink { [weak self] in
+            self?.speech.idleTimeout = $0
+        }.store(in: &observers)
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
+            .sink { [weak self] _ in self?.suspendSpeechResources() }
+            .store(in: &observers)
+        NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
+            .sink { [weak self] _ in self?.suspendSpeechResources() }
+            .store(in: &observers)
+        let pressure = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical],
+                                                               queue: .main)
+        pressure.setEventHandler { [weak self] in
+            MainActor.assumeIsolated { self?.speech.invalidate() }
+        }
+        pressure.resume()
+        memoryPressure = pressure
+    }
+
+    private func suspendSpeechResources() {
+        outgoingAudio?.stopMicrophone()
+        speech.invalidate()
+        if isStarting || isRecording {
+            Task { await endDictation() }
+        } else {
+            outgoingAudio?.cancel()
+            outgoingAudio = nil
+        }
+    }
+
+    private func prepareOutgoingAudio(receivedAt: TimeInterval? = nil) {
+        guard !isRecording, !isStarting, !isFinishingDictation, !isPassiveReceiver,
+              incomingSession == nil, outgoingSession == nil, outgoingAudio == nil else { return }
+        let audio = DictationAudioSession(microphoneUID: settings.microphoneUID,
+                                          latency: SpeechLatency(receivedAt: receivedAt))
+        outgoingAudio = audio
+        audio.onError = { [weak self, weak audio] error in
+            guard let self, self.outgoingAudio === audio else { return }
+            self.fail(error)
+            Task { await self.endDictation() }
+        }
     }
 
     func requestPermissions() async {
@@ -466,11 +557,19 @@ final class BridgeModel: ObservableObject {
     }
 
     func beginDictation() async {
-        guard !isRecording, !isStarting, incomingSession == nil, outgoingSession == nil else { return }
+        if !isRecording, !isStarting, incomingSession != nil || isPassiveReceiver {
+            outgoingAudio?.cancel()
+            outgoingAudio = nil
+        }
+        guard !isRecording, !isStarting, !isFinishingDictation,
+              incomingSession == nil, outgoingSession == nil else { return }
         if isPassiveReceiver {
             receiverStatus = "被操作端待命：等待操作端发送听写"
             return
         }
+        prepareOutgoingAudio()
+        guard let audio = outgoingAudio else { return }
+        audio.confirm()
         isStarting = true
         releaseRequested = false
         focusCancelledSession = nil
@@ -478,6 +577,8 @@ final class BridgeModel: ObservableObject {
         defer { isStarting = false }
         do {
             let route = try await resolveOutputRoute()
+            audio.latency.mark("Route resolved")
+            try Task.checkCancellation()
             let session = UUID()
             outgoingSession = session
             activeOutputRoute = route
@@ -486,6 +587,7 @@ final class BridgeModel: ObservableObject {
                 let localProvider: RecognitionProvider = settings.recognitionProvider == .doubao &&
                     settings.hasDoubaoKey ? .doubao : .apple
                 configureSpeech(localProvider)
+                speech.latency = audio.latency
                 if settings.recognitionProvider == .doubao && !settings.hasDoubaoKey {
                     activeModelStatus = "Apple 本地识别（豆包未配置）"
                 }
@@ -499,19 +601,18 @@ final class BridgeModel: ObservableObject {
                 automaticRouteStatus = "正在输入到本机"
                 overlay.show(label: "准备语音输入", style: route.overlayStyle)
                 do {
-                    try await speech.start(
-                        locale: Locale(identifier: settings.locale),
-                        microphoneUID: settings.microphoneUID
-                    )
+                    try await speech.startNetwork(locale: Locale(identifier: settings.locale))
                 } catch {
                     guard localProvider == .doubao else { throw error }
                     configureSpeech(.apple)
+                    speech.latency = audio.latency
                     activeModelStatus = "Apple 本地识别（豆包启动失败）"
                     automaticRouteStatus = "豆包未就绪，本次使用 Apple 本地识别"
-                    try await speech.start(
-                        locale: Locale(identifier: settings.locale),
-                        microphoneUID: settings.microphoneUID
-                    )
+                    try await speech.startNetwork(locale: Locale(identifier: settings.locale))
+                }
+                try await audio.connect { [weak self] data in
+                    guard let self, self.outgoingSession == session else { return }
+                    self.speech.appendNetworkAudio(data)
                 }
             case .remote(let target):
                 guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.ScreenSharing",
@@ -526,20 +627,19 @@ final class BridgeModel: ObservableObject {
                 speechStatus = "等待 B 端准备…"
                 overlay.show(label: "等待远端就绪", style: route.overlayStyle)
                 try await prepareRemoteSession(session)
-                guard outgoingSession == session else { return }
-                if releaseRequested {
-                    isRecording = true
-                    await endDictation()
-                    return
+                guard outgoingSession == session else { audio.cancel(); return }
+                try await audio.connect { [weak self] data in
+                    guard let self, self.outgoingSession == session else { return }
+                    try self.client.send(self.makeMessage(session: session,
+                                                          type: .audioChunk, audio: data))
                 }
-                try await remoteAudioCapture.start(microphoneUID: settings.microphoneUID)
             }
             guard outgoingSession == session else {
+                audio.cancel()
+                if outgoingAudio === audio { outgoingAudio = nil }
                 if route.isLocal {
                     await speech.cancel()
                     injector.end()
-                } else {
-                    await remoteAudioCapture.cancel()
                 }
                 return
             }
@@ -552,18 +652,16 @@ final class BridgeModel: ObservableObject {
             errorMessage = ""
             if releaseRequested { await endDictation() }
         } catch {
+            audio.cancel()
+            if outgoingAudio === audio { outgoingAudio = nil }
             outgoingFocusMonitor.stop()
             let cancelled = error is CancellationError || focusCancelledSession != nil
             if activeOutputRoute?.isLocal == true {
                 injector.end()
-                if cancelled { await speech.cancel() }
+                await speech.cancel()
             }
             else if activeOutputRoute != nil, let outgoingSession {
-                if cancelled { await remoteAudioCapture.cancel() }
-                else {
-                    await remoteAudioCapture.stop()
-                    try? client.send(makeMessage(session: outgoingSession, type: .audioEnd))
-                }
+                try? client.send(makeMessage(session: outgoingSession, type: .audioCancel))
             }
             remoteReadyTimeout?.cancel()
             outgoingSession = nil
@@ -573,13 +671,14 @@ final class BridgeModel: ObservableObject {
             isFinishingDictation = false
             updateHotkeyAvailability()
             if cancelled {
-                speechStatus = "输入焦点已离开，听写已停止"
+                speechStatus = focusCancelledSession != nil ? "输入焦点已离开，听写已停止" : readySpeechStatus
                 errorMessage = ""
             } else { fail(error) }
         }
     }
 
     func endDictation(requestedAt: TimeInterval? = nil) async {
+        outgoingAudio?.stopMicrophone()
         outgoingFocusMonitor.stop()
         let stopRequestedAt = requestedAt ?? ProcessInfo.processInfo.systemUptime
         if isStarting && !isRecording {
@@ -599,11 +698,13 @@ final class BridgeModel: ObservableObject {
         overlay.show(label: "正在完成", style: activeOutputRoute?.overlayStyle ?? .local,
                      animate: false)
         if activeOutputRoute?.isLocal == true {
+            await outgoingAudio?.stop()
             await speech.stop()
             injector.end()
         } else if activeOutputRoute != nil, let outgoingSession {
             let captureStopStarted = Date()
-            await remoteAudioCapture.stop()
+            await outgoingAudio?.stop()
+            outgoingAudio = nil
             remoteCaptureStopSeconds = Date().timeIntervalSince(captureStopStarted)
             guard self.outgoingSession == outgoingSession else { return }
             do {
@@ -627,6 +728,7 @@ final class BridgeModel: ObservableObject {
             return
         }
         outgoingSession = nil
+        outgoingAudio = nil
         activeOutputRoute = nil
         overlay.hide()
         hotkey.setInterceptionActive(false)
@@ -640,6 +742,8 @@ final class BridgeModel: ObservableObject {
         guard outgoingSession == session, (isRecording || isStarting),
               !isFinishingDictation else { return }
         focusCancelledSession = session
+        outgoingAudio?.cancel()
+        outgoingAudio = nil
         outgoingFocusMonitor.stop()
         let route = activeOutputRoute
         let wasRecording = isRecording
@@ -664,7 +768,6 @@ final class BridgeModel: ObservableObject {
         Task { @MainActor in
             if wasRecording {
                 if route?.isLocal == true { await speech.cancel() }
-                else { await remoteAudioCapture.cancel() }
             }
             guard focusCancelledSession == session else { return }
             overlay.hide()
@@ -792,6 +895,10 @@ final class BridgeModel: ObservableObject {
             isCapturingShortcut = false
         }
         hotkey.setEnabled(shouldEnable)
+        if passive {
+            outgoingAudio?.cancel()
+            outgoingAudio = nil
+        }
         if passive, isRecording || isStarting {
             Task { @MainActor in await endDictation() }
         }
@@ -948,6 +1055,8 @@ final class BridgeModel: ObservableObject {
                     sendIncomingError("B 端正在完成上一段听写，请稍后重试。", for: message, to: connectionID)
                     return
                 }
+                outgoingAudio?.cancel()
+                outgoingAudio = nil
                 injector.end()
                 incomingSession = message.sessionId
                 activeConnectionID = connectionID
@@ -1269,6 +1378,8 @@ final class BridgeModel: ObservableObject {
     }
 
     private func clearOutgoingRemoteSession() {
+        outgoingAudio?.cancel()
+        outgoingAudio = nil
         linkWatchdog?.cancel()
         linkWatchdog = nil
         outgoingFocusMonitor.stop()
@@ -1350,7 +1461,8 @@ final class BridgeModel: ObservableObject {
                 continuation.resume(throwing: CancellationError())
             } else {
                 Task { @MainActor in
-                    await self.remoteAudioCapture.cancel()
+                    self.outgoingAudio?.cancel()
+                    self.outgoingAudio = nil
                     self.clearOutgoingRemoteSession()
                     self.speechStatus = reason
                     self.errorMessage = ""
@@ -1369,7 +1481,8 @@ final class BridgeModel: ObservableObject {
                     self.isRecording = false
                     self.isFinishingDictation = true
                     self.updateHotkeyAvailability()
-                    await self.remoteAudioCapture.cancel()
+                    self.outgoingAudio?.cancel()
+                    self.outgoingAudio = nil
                     self.clearOutgoingRemoteSession()
                     self.fail(error)
                 }
