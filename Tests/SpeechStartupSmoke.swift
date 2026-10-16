@@ -46,6 +46,7 @@ private final class FakeCapture: DictationAudioCapture {
     var latency: SpeechLatency?
     var running = false
     var canStartSpeculatively = true
+    var minimumReadyAudioBytes = 1
     var starts = 0
     var cancelled = false
     var tail: Data?
@@ -80,9 +81,10 @@ struct SpeechStartupSmoke {
         FileHandle.standardError.write(Data("Testing speech lifecycle\n".utf8))
         try await lifecycle()
         FileHandle.standardError.write(Data("Testing audio sessions\n".utf8))
+        try await captureReadiness()
         try await audioSession()
         bufferBounds()
-        print("PASS: Cold/Warm reuse, renewed/cancelled idle deadlines, immediate/always policies, invalidation, startup PCM order, stop tail, and speculative cancellation")
+        print("PASS: Cold/Warm lifecycle, first audio and Bluetooth readiness, cancellation/timeout, startup PCM order, stop tail, and speculative cancellation")
     }
 
     @MainActor
@@ -148,6 +150,123 @@ struct SpeechStartupSmoke {
         fake.onError?(BridgeError.unsupportedLocale)
         await speech.stop()
         precondition(speech.state == .cold && !fake.retainsOnStop)
+    }
+
+    @MainActor
+    private static func captureReadiness() async throws {
+        let capture = FakeCapture()
+        let audio = DictationAudioSession(microphoneUID: "", latency: SpeechLatency(), capture: capture)
+        audio.confirm()
+        await eventually { capture.running }
+        var connected = false
+        var received = Data()
+        let connection = Task { @MainActor in
+            try await audio.connect { received.append($0) }
+            connected = true
+        }
+        for _ in 0..<100 { await Task.yield() }
+        precondition(!connected, "Microphone start is not audio readiness: wait for the first captured packet")
+        capture.onPacket?(Data())
+        for _ in 0..<100 { await Task.yield() }
+        precondition(!connected, "An empty callback must not mark microphone audio ready")
+        let opening = Data([1, 2, 3, 4])
+        capture.onPacket?(opening)
+        try await connection.value
+        precondition(connected && received == opening, "The first packet must reach the engine before ready")
+        await audio.stop()
+
+        let bluetoothCapture = FakeCapture()
+        bluetoothCapture.minimumReadyAudioBytes = 64_000
+        let bluetooth = DictationAudioSession(microphoneUID: "", latency: SpeechLatency(), capture: bluetoothCapture)
+        bluetooth.confirm()
+        await eventually { bluetoothCapture.running }
+        var bluetoothReady = false
+        var bluetoothAudio = Data()
+        let bluetoothConnection = Task { @MainActor in
+            try await bluetooth.connect { bluetoothAudio.append($0) }
+            bluetoothReady = true
+        }
+        let firstBluetoothPacket = Data(repeating: 1, count: 6_400)
+        bluetoothCapture.onPacket?(firstBluetoothPacket)
+        for _ in 0..<100 { await Task.yield() }
+        precondition(!bluetoothReady, "The first Bluetooth packet must not bypass its startup window")
+        let intermediateBluetoothAudio = Data(repeating: 2, count: 51_200)
+        bluetoothCapture.onPacket?(intermediateBluetoothAudio)
+        for _ in 0..<100 { await Task.yield() }
+        precondition(!bluetoothReady, "0.9 seconds of Bluetooth audio must still be preparing")
+        let finalBluetoothPacket = Data(repeating: 3, count: 6_400)
+        bluetoothCapture.onPacket?(finalBluetoothPacket)
+        try await bluetoothConnection.value
+        precondition(bluetoothReady && bluetoothAudio == firstBluetoothPacket + intermediateBluetoothAudio + finalBluetoothPacket,
+                     "Bluetooth startup audio must be retained in full, not discarded as warmup")
+        await bluetooth.stop()
+
+        let shortBluetoothCapture = FakeCapture()
+        shortBluetoothCapture.minimumReadyAudioBytes = 64_000
+        let shortBluetooth = DictationAudioSession(microphoneUID: "", latency: SpeechLatency(), capture: shortBluetoothCapture)
+        shortBluetooth.confirm()
+        await eventually { shortBluetoothCapture.running }
+        shortBluetoothCapture.onPacket?(firstBluetoothPacket)
+        shortBluetooth.stopMicrophone()
+        var shortBluetoothAudio = Data()
+        try await shortBluetooth.connect { shortBluetoothAudio.append($0) }
+        await shortBluetooth.stop()
+        precondition(shortBluetoothAudio == firstBluetoothPacket,
+                     "Releasing during Bluetooth startup must still submit the captured short utterance")
+
+        let releasedCapture = FakeCapture()
+        let released = DictationAudioSession(microphoneUID: "", latency: SpeechLatency(), capture: releasedCapture)
+        released.confirm()
+        await eventually { releasedCapture.running }
+        var releasedAudio = Data()
+        let releasedConnection = Task { @MainActor in
+            try await released.connect { releasedAudio.append($0) }
+        }
+        for _ in 0..<100 { await Task.yield() }
+        releasedCapture.tail = opening
+        released.stopMicrophone()
+        try await releasedConnection.value
+        await released.stop()
+        precondition(releasedAudio == opening, "Release before the first packet must preserve the converter tail")
+
+        let cancelledCapture = FakeCapture()
+        let cancelled = DictationAudioSession(microphoneUID: "", latency: SpeechLatency(), capture: cancelledCapture)
+        cancelled.confirm()
+        await eventually { cancelledCapture.running }
+        let cancelledConnection = Task { @MainActor in try await cancelled.connect { _ in } }
+        for _ in 0..<100 { await Task.yield() }
+        cancelled.cancel()
+        do {
+            try await cancelledConnection.value
+            preconditionFailure("Cancelling before audio must unblock readiness with an error")
+        } catch is CancellationError {}
+
+        let silentCapture = FakeCapture()
+        let silent = DictationAudioSession(microphoneUID: "", latency: SpeechLatency(), capture: silentCapture,
+                                          firstAudioTimeout: .milliseconds(10))
+        silent.confirm()
+        do {
+            try await silent.connect { _ in preconditionFailure("A stalled input must not submit audio") }
+            preconditionFailure("A stalled microphone must fail instead of showing ready")
+        } catch {
+            precondition(!silentCapture.running)
+        }
+        silent.cancel()
+
+        let failedCapture = FakeCapture()
+        let failed = DictationAudioSession(microphoneUID: "", latency: SpeechLatency(), capture: failedCapture)
+        failed.confirm()
+        await eventually { failedCapture.running }
+        let failedConnection = Task { @MainActor in try await failed.connect { _ in } }
+        for _ in 0..<100 { await Task.yield() }
+        failedCapture.onError?(BridgeError.transport("Input disconnected"))
+        do {
+            try await failedConnection.value
+            preconditionFailure("An input failure must unblock readiness with its original error")
+        } catch {
+            precondition(error.localizedDescription == "Input disconnected" && !failedCapture.running)
+        }
+        failed.cancel()
     }
 
     @MainActor
@@ -236,6 +355,8 @@ struct SpeechStartupSmoke {
         let confirmedFirstUse = DictationAudioSession(microphoneUID: "", latency: SpeechLatency(),
                                                       capture: firstUseCapture)
         confirmedFirstUse.confirm()
+        await eventually { firstUseCapture.running }
+        firstUseCapture.onPacket?(head)
         try await confirmedFirstUse.connect { _ in }
         precondition(firstUseCapture.starts == 1)
         await confirmedFirstUse.stop()

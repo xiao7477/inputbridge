@@ -43,6 +43,7 @@ final class RemoteAudioCapture: DictationAudioCapture {
     var onPacket: ((Data) -> Void)?
     var onError: ((Error) -> Void)?
     var latency: SpeechLatency?
+    private(set) var minimumReadyAudioBytes = 1
     var canStartSpeculatively: Bool {
         AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
     }
@@ -78,6 +79,11 @@ final class RemoteAudioCapture: DictationAudioCapture {
 
         let engine = AVAudioEngine()
         try AudioInputDeviceManager.configure(engine, deviceUID: microphoneUID)
+        // Keep the prefix while the Bluetooth input profile settles. Restore
+        // the one-second window after the half-second device trial clipped speech.
+        // Wired/default non-Bluetooth devices still need only their first packet.
+        minimumReadyAudioBytes = AudioInputDeviceManager.isBluetoothInput(engine) ? 64_000 : 1
+        if minimumReadyAudioBytes > 1 { latency?.mark("Bluetooth microphone startup") }
         let inputNode = engine.inputNode
         let sourceFormat = inputNode.outputFormat(forBus: 0)
         guard sourceFormat.sampleRate > 0, sourceFormat.channelCount > 0 else {

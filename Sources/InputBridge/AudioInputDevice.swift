@@ -53,6 +53,29 @@ enum AudioInputDeviceManager {
         }
     }
 
+    /// Inspect the resolved input device after configuration, including when
+    /// following the system default. Bluetooth profile switching can continue
+    /// after the audio engine has started returning buffers.
+    static func isBluetoothInput(_ engine: AVAudioEngine) -> Bool {
+        guard let unit = engine.inputNode.audioUnit else { return false }
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                   kAudioUnitScope_Global, 0, &deviceID, &size) == noErr else { return false }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var transport = UInt32(0)
+        size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &transport) == noErr else {
+            return false
+        }
+        return transport == kAudioDeviceTransportTypeBluetooth ||
+            transport == kAudioDeviceTransportTypeBluetoothLE
+    }
+
     private static func allDeviceIDs() -> [AudioDeviceID] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,

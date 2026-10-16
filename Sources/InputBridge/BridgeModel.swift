@@ -644,13 +644,16 @@ final class BridgeModel: ObservableObject {
                 return
             }
             isRecording = true
+            if releaseRequested {
+                await endDictation()
+                return
+            }
             hotkey.setInterceptionActive(true)
             overlay.show(style: route.overlayStyle)
             speechStatus = route.isLocal
                 ? "正在本机听写…"
                 : "B 已就绪，正在发送音频…"
             errorMessage = ""
-            if releaseRequested { await endDictation() }
         } catch {
             audio.cancel()
             if outgoingAudio === audio { outgoingAudio = nil }
